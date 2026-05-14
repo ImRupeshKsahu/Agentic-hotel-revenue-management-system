@@ -1,0 +1,17 @@
+-> ADR (Average Daily Rate)
+
+Daily ADR = Sum of Rates for all Guests staying that night / Total Guests staying that night
+
+How to get this from transactions data - "unroll" the bookings so that Guest A appears on July 1, July 2, and July 3 if he had booked for these three nights. Then, for every specific calendar date, we took the Average of the price paid by everyone staying that night.
+
+-> Occupancy Rate
+
+Occupancy Rate = Rooms Sold / Total Rooms Available
+
+-> RevPAR (Revenue per Available Room) = Occupacy Rate * ADR
+   Combines price + demand
+
+-> Competitor Rate is competitor's ADR
+
+-> local event column includes public holidays and some other local events
+

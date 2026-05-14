@@ -1,0 +1,31 @@
+# Core app and PMS data pipeline
+numpy>=2.3
+pandas>=2.3
+python-dateutil>=2.9
+pytz>=2024.1
+streamlit>=1.52
+plotly>=5.24
+python-dotenv>=1.0
+
+# Forecasting and model comparison
+# scikit-learn is optional at runtime; when unavailable, the app falls back to baseline models.
+scikit-learn>=1.7
+xgboost>=3.2
+statsmodels>=0.14.6
+
+# Agentic pricing and LLM calls
+openai>=1.10
+httpx>=0.26
+langgraph>=0.2.60
+packaging>=24.0
+requests>=2.31
+
+# Notebook/EDA support
+matplotlib>=3.10
+seaborn>=0.13
+
+# Optional Prophet support:
+# Prophet is no longer required for the MVP pipeline. Install it separately only if
+# a Python 3.14-compatible wheel is available in your environment.
+# prophet>=1.1.6
+# cmdstanpy>=1.2.4

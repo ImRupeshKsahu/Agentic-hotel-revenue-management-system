@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.new_env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated model/output artifacts
+src/models/*.pkl
+data/plots/
+data/*_output.csv
+data/*metrics*.csv
+data/backtest_*.csv
+data/forecast_champion.json
+data/live_market_state.json
+data/otb_snapshot_*.csv
+model_validation_plot.png
