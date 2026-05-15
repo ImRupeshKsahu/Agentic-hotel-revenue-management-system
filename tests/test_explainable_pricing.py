@@ -29,6 +29,8 @@ class FakeCompletions:
 
 class ExplainablePricingTests(unittest.TestCase):
     def tearDown(self):
+        if hasattr(self, "_original_resolve_api_key"):
+            pricing_agent._resolve_api_key = self._original_resolve_api_key
         pricing_agent.create_pricing_agent.cache_clear()
 
     def test_breakdown_components_sum_to_final_price(self):
@@ -46,10 +48,12 @@ class ExplainablePricingTests(unittest.TestCase):
         )
 
         self.assertEqual(price, total_from_components)
-        self.assertIn("Manual demand adjustment", [component["driver"] for component in breakdown["components"]])
+        self.assertIn("Candidate optimization", [component["driver"] for component in breakdown["components"]])
+        self.assertEqual(price, breakdown["selected_candidate"]["price"])
+        self.assertTrue(breakdown["optimizer_candidates"])
         self.assertGreater(price, BASE_PRICE)
 
-    def test_ai_suggestion_is_clamped_by_guardrails(self):
+    def test_ai_suggestion_cannot_change_optimizer_price(self):
         pricing_agent.client = SimpleNamespace(
             chat=SimpleNamespace(
                 completions=FakeCompletions({
@@ -76,24 +80,86 @@ class ExplainablePricingTests(unittest.TestCase):
             booking_velocity=1.4,
         )
 
-        self.assertEqual(result["final_adr"], result["adjustment_band"]["max_allowed"])
+        self.assertEqual(result["final_adr"], result["optimized_price"])
         self.assertLess(result["final_adr"], 400.0)
-        self.assertTrue(any("clamped" in item for item in result["guardrails_applied"]))
+        self.assertEqual(result["strategy_applied"], "Accept Optimizer Price")
         self.assertEqual(
-            [row["Driver"] for row in result["price_components"]],
+            [row["Driver"] for row in result["price_path_components"]],
             [
                 "Base rate",
-                "Occupancy lift",
-                "Manual demand adjustment",
-                "Local intel adjustment",
-                "Day-of-week effect",
-                "Competitor cap",
-                "Pace premium",
+                "Reference price",
+                "Candidate optimization",
                 "Final recommendation",
+                "Reference delta",
             ],
         )
+        self.assertEqual(
+            [row["Signal"] for row in result["decision_context_components"]],
+            ["Demand anchor", "Competitor signal", "AI advisory"],
+        )
 
-    def test_manual_shock_is_explained_once_in_baseline(self):
+    def test_missing_ai_key_keeps_optimizer_price_with_clean_advisory(self):
+        self._original_resolve_api_key = pricing_agent._resolve_api_key
+        pricing_agent._resolve_api_key = lambda: ""
+        pricing_agent.client = None
+
+        result = pricing_agent.run_agentic_pricing(
+            target_date="2017-09-02",
+            current_occupancy=0.80,
+            forecasted_occupancy=0.82,
+            shock=0.0,
+            competitor_price=130.0,
+            booking_velocity=1.0,
+        )
+
+        self.assertEqual(result["final_adr"], result["optimized_price"])
+        self.assertEqual(result["strategy_applied"], "Review Before Publishing")
+        self.assertIn("AI advisory is unavailable", result["strategic_reasoning"])
+
+    def test_ai_owner_summary_is_manager_friendly(self):
+        self._original_resolve_api_key = pricing_agent._resolve_api_key
+        pricing_agent._resolve_api_key = lambda: "test-key"
+        pricing_agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=FakeCompletions({
+                    "ai_recommended_action": "Review Before Publishing",
+                    "ai_risk_level": "Medium",
+                    "perceived_demand_strength": "High",
+                    "ai_review_flags": [
+                        "Optimizer diagnostics show high elasticity against the blended reference price."
+                    ],
+                    "ai_owner_summary": (
+                        "The candidate optimizer selected the ADR from expected revenue among candidates. "
+                        "The blended reference price and elasticity diagnostics support the recommendation."
+                    ),
+                })
+            )
+        )
+
+        result = pricing_agent.run_agentic_pricing(
+            target_date="2017-09-02",
+            current_occupancy=0.949,
+            forecasted_occupancy=0.93,
+            shock=0.0,
+            competitor_price=138.41,
+            booking_velocity=1.32,
+        )
+
+        banned_terms = [
+            "blended reference price",
+            "candidate optimizer",
+            "expected revenue among candidates",
+            "elasticity",
+            "diagnostics",
+        ]
+        summary = result["strategic_reasoning"].lower()
+        self.assertEqual(result["final_adr"], result["optimized_price"])
+        self.assertLessEqual(pricing_agent._sentence_count(result["strategic_reasoning"]), 3)
+        self.assertFalse(any(term in summary for term in banned_terms))
+        self.assertIn("ADR", result["strategic_reasoning"])
+        self.assertIn("Review Before Publishing", result["strategy_applied"])
+
+    def test_manual_shock_changes_optimizer_demand_anchor(self):
         price, _, breakdown = calculate_recommended_price(
             occupancy=0.90,
             pre_shock_occupancy=0.80,
@@ -101,13 +167,10 @@ class ExplainablePricingTests(unittest.TestCase):
             competitor_price=200,
             return_breakdown=True,
         )
-        event_component = next(
-            component for component in breakdown["components"]
-            if component["driver"] == "Manual demand adjustment"
-        )
 
-        self.assertEqual(event_component["adjustment"], 10.0)
-        self.assertEqual(price, 140.0)
+        self.assertEqual(breakdown["manual_shock"], 0.1)
+        self.assertEqual(breakdown["demand_anchor"], 0.9)
+        self.assertEqual(price, breakdown["selected_candidate"]["price"])
 
     def test_traffic_jam_defaults_to_context_only(self):
         estimate = estimate_local_intel_impact(
@@ -243,8 +306,8 @@ class ExplainablePricingTests(unittest.TestCase):
             local_intel_applied_shock=estimate["suggested_shock"],
         )
 
-        self.assertEqual(context_only["rule_based_price"], 120.0)
-        self.assertGreater(applied["rule_based_price"], context_only["rule_based_price"])
+        self.assertEqual(context_only["rule_based_price"], context_only["optimized_price"])
+        self.assertGreater(applied["optimized_price"], context_only["optimized_price"])
         self.assertIn("Local intel was considered as context only", context_only["strategic_reasoning"])
 
 

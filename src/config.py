@@ -30,6 +30,7 @@ BASE_CAPACITY = 237 # integer capacity
 DEFAULT_HOTEL = "City Hotel"
 MIN_PRICE = 80
 MAX_PRICE = 250
+PRICE_STEP = 5
 DEFAULT_EVENT_IMPACT = 0.20 # 20% demand boost
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 CHAT_MODEL = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")

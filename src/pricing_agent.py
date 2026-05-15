@@ -1,11 +1,13 @@
 import json
 import math
+import os
+import re
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
 from pricing_engine import calculate_recommended_price
-from config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE
+from config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE
 from openai import OpenAI
 from utils.utility_functions import load_prompt
 import httpx
@@ -19,16 +21,40 @@ client = None
 def _get_client():
     global client
     if client is None:
-        if not API_KEY:
-            raise RuntimeError("DEEPSEEK_API_KEY is not set. Add it to .env before using AI pricing.")
-        client = OpenAI(api_key=API_KEY, base_url=BASE_URL, http_client=http_client)
+        api_key = _resolve_api_key()
+        if not api_key:
+            raise RuntimeError("AI advisory is unavailable because DEEPSEEK_API_KEY is not configured.")
+        client = OpenAI(api_key=api_key, base_url=BASE_URL, http_client=http_client)
     return client
+
+
+def _resolve_api_key() -> str:
+    key = (API_KEY or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+    if key and key != "your_deepseek_api_key_here":
+        return key
+
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for line in env_file:
+                if line.strip().startswith("DEEPSEEK_API_KEY="):
+                    _, value = line.split("=", 1)
+                    key = value.strip().strip('"').strip("'")
+                    if key and key != "your_deepseek_api_key_here":
+                        return key
+    except OSError:
+        pass
+
+    return ""
 
 # 1. Enhanced Agent State
 class AgentState(TypedDict):
     target_date: str
     forecasted_occupancy: float
     current_occupancy: float
+    raw_otb_occupancy: float
+    adjusted_otb_occupancy: float
+    expected_cancellations: float
     competitor_price: float
     demand_shock: float
     manual_demand_shock: float
@@ -44,23 +70,32 @@ class AgentState(TypedDict):
     booking_velocity: float 
     
     # Internal Logic
+    optimized_price: float
+    optimizer_price: float
+    optimizer_diagnostics: Dict[str, Any]
     rule_based_price: float
     logic_flags: List[str]
     base_occupancy: float
     pricing_breakdown: Dict[str, Any]
-    adjustment_band: Dict[str, Any]
     
-    # Agent Output
+    # Advisory + Final Output
     final_adr: float
     strategic_reasoning: str
     strategy_applied: str
+    ai_recommended_action: str
+    ai_risk_level: str
+    ai_review_flags: List[str]
+    ai_owner_summary: str
     perceived_demand_strength: str
     absolute_delta: float
+    pct_delta_from_reference: float
     pct_delta_from_baseline: float
     competitor_gap_pct: float
     guardrails_applied: List[str]
     manual_approval_required: bool
     price_components: List[Dict[str, Any]]
+    price_path_components: List[Dict[str, Any]]
+    decision_context_components: List[Dict[str, Any]]
 
 
 def _target_day_name(target_date: str) -> str:
@@ -88,6 +123,84 @@ def _pct(value) -> float:
     return round(float(value), 2)
 
 
+TECHNICAL_SUMMARY_TERMS = [
+    "blended reference price",
+    "candidate optimizer",
+    "expected revenue among candidates",
+    "elasticity",
+    "diagnostics",
+    "algorithm",
+    "model math",
+]
+
+
+def _sentence_count(text: str) -> int:
+    without_decimal_points = re.sub(r"(?<=\d)\.(?=\d)", "", text or "")
+    return len([part for part in re.split(r"[.!?]+", without_decimal_points) if part.strip()])
+
+
+def _needs_manager_rewrite(summary: str) -> bool:
+    normalized = (summary or "").lower()
+    return (
+        not normalized.strip()
+        or any(term in normalized for term in TECHNICAL_SUMMARY_TERMS)
+        or _sentence_count(summary) > 3
+    )
+
+
+def _pace_phrase(booking_velocity: float) -> str:
+    if booking_velocity >= 1.20:
+        return f"pickup is running {round((booking_velocity - 1) * 100)}% ahead of normal pace"
+    if booking_velocity <= 0.80:
+        return f"pickup is running {round((1 - booking_velocity) * 100)}% behind normal pace"
+    return "pickup is close to normal pace"
+
+
+def _manager_summary(state: AgentState, action: str) -> str:
+    adr = _safe_float(state.get("optimized_price"), MIN_PRICE)
+    occupancy = max(_safe_float(state.get("current_occupancy")), _safe_float(state.get("forecasted_occupancy")))
+    booking_velocity = _safe_float(state.get("booking_velocity"), 1.0)
+    competitor_price = _safe_float(state.get("competitor_price"), 0.0)
+    competitor_phrase = (
+        f"Competitors are priced at ${competitor_price:.2f}, so this ADR is still below the market."
+        if competitor_price and adr <= competitor_price
+        else f"Competitors are priced at ${competitor_price:.2f}, so confirm the premium fits your positioning."
+        if competitor_price
+        else "Competitor pricing is unavailable, so treat this as an internal demand-led recommendation."
+    )
+    action_sentence = {
+        "Accept Optimizer Price": "Accept the optimizer price if the remaining-room strategy is unchanged.",
+        "Review Before Publishing": "Review before publishing to confirm the ADR fits your positioning and remaining-room strategy.",
+        "Hold For Manual Approval": "Hold for manual approval before publishing because the risk level is elevated.",
+        "Investigate Data Quality": "Investigate the data quality before publishing this ADR.",
+    }.get(action, "Review before publishing to confirm the ADR fits your positioning and remaining-room strategy.")
+
+    return (
+        f"The recommended ADR is ${adr:.2f} because the hotel is already {occupancy * 100:.1f}% booked and {_pace_phrase(booking_velocity)}. "
+        f"{competitor_phrase} "
+        f"{action_sentence}"
+    )
+
+
+def _manager_friendly_flags(flags) -> List[str]:
+    cleaned = []
+    replacements = {
+        "blended reference price": "usual pricing level",
+        "reference price": "usual pricing level",
+        "optimizer": "system",
+        "diagnostics": "data",
+        "elasticity": "price sensitivity",
+    }
+    for flag in flags or []:
+        text = str(flag).strip()
+        if not text:
+            continue
+        for old, new in replacements.items():
+            text = re.sub(old, new, text, flags=re.IGNORECASE)
+        cleaned.append(text[:140])
+    return cleaned[:3]
+
+
 def _find_component(breakdown: Dict[str, Any], driver: str) -> Dict[str, Any]:
     for component in breakdown.get("components", []):
         if component.get("driver") == driver:
@@ -101,121 +214,57 @@ def _find_component(breakdown: Dict[str, Any], driver: str) -> Dict[str, Any]:
     }
 
 
-def _build_adjustment_band(state: AgentState) -> Dict[str, Any]:
-    baseline = _safe_float(state.get("rule_based_price"), MIN_PRICE)
-    current_occ = _safe_float(state.get("current_occupancy"))
-    forecast_occ = _safe_float(state.get("forecasted_occupancy"))
-    velocity = _safe_float(state.get("booking_velocity"), 1.0)
-    competitor_price = _safe_float(state.get("competitor_price"), 0.0)
-
-    lower_pct = -0.05
-    upper_pct = 0.10
-    reasons = ["AI suggestion must remain inside the deterministic safety bounds."]
-
-    if velocity > 1.2 and current_occ > 0.70:
-        upper_pct = max(upper_pct, 0.15)
-        reasons.append("Fast pickup allows a controlled pace premium up to 15%.")
-    if forecast_occ > 0.93:
-        upper_pct = max(upper_pct, 0.12)
-        reasons.append("Very strong forecast demand allows a modest premium above baseline.")
-    if current_occ > 0.95:
-        upper_pct = max(upper_pct, 0.20)
-        reasons.append("Scarce remaining inventory allows a larger but still bounded premium.")
-    if velocity < 0.8 and forecast_occ < 0.70:
-        lower_pct = -0.10
-        reasons.append("Weak pickup and low forecast allow a controlled discount up to 10%.")
-
-    min_allowed = max(MIN_PRICE, baseline * (1 + lower_pct))
-    max_allowed = min(MAX_PRICE, baseline * (1 + upper_pct))
-
-    if competitor_price > 0:
-        competitor_ceiling_pct = 1.40 if current_occ > 0.95 else 1.25
-        competitor_ceiling = competitor_price * competitor_ceiling_pct
-        if max_allowed > competitor_ceiling:
-            max_allowed = competitor_ceiling
-            reasons.append(f"Competitor-relative ceiling capped unattended AI premium at {competitor_ceiling_pct - 1:.0%} above market.")
-
-    approval_cap = min(baseline * 1.15, baseline + 30)
-    if max_allowed > approval_cap:
-        max_allowed = approval_cap
-        reasons.append("Larger AI premiums require manual approval, so the unattended recommendation is capped.")
-
-    min_allowed = _money(min_allowed)
-    max_allowed = _money(max(min_allowed, max_allowed))
-
+def _format_component_row(component: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "min_allowed": min_allowed,
-        "max_allowed": max_allowed,
-        "lower_pct": _pct(lower_pct * 100),
-        "upper_pct": _pct(((max_allowed / baseline) - 1) * 100) if baseline else 0.0,
-        "reasons": reasons,
+        "Driver": component["driver"],
+        "Adjustment": f"${component['adjustment']:+.2f}",
+        "Price After": f"${component['price_after']:.2f}",
+        "Why": component["explanation"],
     }
 
 
-def _validate_ai_price(ai_decision: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
-    band = state["adjustment_band"]
-    baseline = _safe_float(state.get("rule_based_price"), MIN_PRICE)
-    raw_price = _safe_float(
-        ai_decision.get("final_price", ai_decision.get("override_price", baseline)),
-        baseline,
-    )
-    guardrails = list(band.get("reasons", []))
-    local_estimate = state.get("local_intel_estimate") or {}
-    guardrails.extend(local_estimate.get("guardrails_applied", []))
-    if state.get("manual_event_text") and state.get("local_intel_applied_shock", 0.0) == 0:
-        guardrails.append("Local intel was considered as context only and was not included in the baseline price.")
-
-    final_price = min(max(raw_price, band["min_allowed"]), band["max_allowed"])
-    final_price = min(max(final_price, MIN_PRICE), MAX_PRICE)
-    final_price = _money(final_price)
-
-    if _money(raw_price) != final_price:
-        guardrails.append(f"AI suggested ${_money(raw_price):.2f}; validated recommendation was clamped to ${final_price:.2f}.")
-
-    absolute_delta = _money(final_price - baseline)
-    pct_delta = _pct((absolute_delta / baseline) * 100) if baseline else 0.0
-    competitor_price = _safe_float(state.get("competitor_price"), 0.0)
-    competitor_gap = _pct(((final_price - competitor_price) / competitor_price) * 100) if competitor_price else 0.0
-    manual_approval_required = abs(pct_delta) > 15 or abs(absolute_delta) > 30
-
-    return {
-        "final_adr": final_price,
-        "absolute_delta": absolute_delta,
-        "pct_delta_from_baseline": pct_delta,
-        "competitor_gap_pct": competitor_gap,
-        "guardrails_applied": guardrails,
-        "manual_approval_required": manual_approval_required,
-    }
-
-
-def _build_price_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
+def _build_price_path_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
     breakdown = state.get("pricing_breakdown", {})
-    baseline = _safe_float(state.get("rule_based_price"), MIN_PRICE)
-    pace_delta = _money(final_adr - baseline)
+    reference_price = _safe_float(breakdown.get("reference_price"), _safe_float(state.get("rule_based_price"), MIN_PRICE))
 
-    rows = []
-    for driver in ["Base rate", "Occupancy lift", "Manual demand adjustment", "Local intel adjustment", "Day-of-week effect", "Competitor cap"]:
-        component = _find_component(breakdown, driver)
-        rows.append({
-            "Driver": component["driver"],
-            "Adjustment": f"${component['adjustment']:+.2f}",
-            "Price After": f"${component['price_after']:.2f}",
-            "Why": component["explanation"],
-        })
-
+    rows = [
+        _format_component_row(_find_component(breakdown, driver))
+        for driver in ["Base rate", "Reference price", "Candidate optimization", "Final recommendation"]
+    ]
     rows.append({
-        "Driver": "Pace premium",
-        "Adjustment": f"${pace_delta:+.2f}",
+        "Driver": "Reference delta",
+        "Adjustment": f"${_money(final_adr - reference_price):+.2f}",
         "Price After": f"${final_adr:.2f}",
-        "Why": "AI-reviewed strategy adjustment after guardrails; manual and local-intel demand are not counted again here.",
-    })
-    rows.append({
-        "Driver": "Final recommendation",
-        "Adjustment": "$+0.00",
-        "Price After": f"${final_adr:.2f}",
-        "Why": "Final ADR after deterministic rules, AI review, and external guardrails.",
+        "Why": "Final optimizer ADR compared with the blended reference price.",
     })
     return rows
+
+
+def _build_decision_context_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
+    breakdown = state.get("pricing_breakdown", {})
+    context_rows = []
+    for driver in ["Demand anchor", "Competitor signal"]:
+        component = _find_component(breakdown, driver)
+        context_rows.append({
+            "Signal": component["driver"],
+            "Value": (
+                f"{round(_safe_float(breakdown.get('demand_anchor'), 0.0) * 100)}%"
+                if driver == "Demand anchor"
+                else (
+                    f"${_safe_float(breakdown.get('competitor_price'), 0.0):.2f}"
+                    if breakdown.get("competitor_price") is not None
+                    else "Unavailable"
+                )
+            ),
+            "Why it matters": component["explanation"],
+        })
+
+    context_rows.append({
+        "Signal": "AI advisory",
+        "Value": "Review only",
+        "Why it matters": "AI reviewed risks and explanation only; it did not change the optimizer price.",
+    })
+    return context_rows
 
 
 def data_ingestion_node(state: AgentState):
@@ -227,15 +276,28 @@ def data_ingestion_node(state: AgentState):
     date_data = state.get("market_state") or {}
     velocity = float(date_data.get("booking_velocity", state.get("booking_velocity", 1.0)))
     competitor_price = float(date_data.get("competitor_price", state.get("competitor_price", 120.0)))
+    raw_otb_occupancy = _safe_float(date_data.get("raw_otb_occupancy"), _safe_float(state.get("raw_otb_occupancy"), 0.0))
+    adjusted_otb_occupancy = _safe_float(
+        date_data.get("adjusted_otb_occupancy"),
+        _safe_float(state.get("adjusted_otb_occupancy"), state.get("current_occupancy", 0.0)),
+    )
+    expected_cancellations = _safe_float(
+        date_data.get("expected_cancellations"),
+        _safe_float(state.get("expected_cancellations"), 0.0),
+    )
 
     return {
         "booking_velocity": velocity,
         "competitor_price": competitor_price,
+        "raw_otb_occupancy": raw_otb_occupancy,
+        "adjusted_otb_occupancy": adjusted_otb_occupancy,
+        "expected_cancellations": expected_cancellations,
     }
 
-# --- NODE 1: THE RULES EXPERT ---
-def rules_expert_node(state: AgentState):
-    base_occ = max(state['forecasted_occupancy'], state["current_occupancy"])
+# --- NODE 1: THE OPTIMIZER ---
+def optimizer_node(state: AgentState):
+    adjusted_otb_occupancy = _safe_float(state.get("adjusted_otb_occupancy"), state["current_occupancy"])
+    base_occ = max(state['forecasted_occupancy'], adjusted_otb_occupancy)
     manual_shock = _safe_float(state.get("manual_demand_shock"), _safe_float(state.get("demand_shock"), 0.0))
     local_intel_shock = _safe_float(state.get("local_intel_applied_shock"), 0.0)
     total_shock = manual_shock + local_intel_shock
@@ -251,6 +313,11 @@ def rules_expert_node(state: AgentState):
         pre_shock_occupancy=base_occ,
         manual_shock=manual_shock,
         local_intel_shock=local_intel_shock,
+        booking_velocity=state.get("booking_velocity", 1.0),
+        manual_event_text=state.get("manual_event_text", ""),
+        raw_otb_occupancy=state.get("raw_otb_occupancy"),
+        adjusted_otb_occupancy=adjusted_otb_occupancy,
+        expected_cancellations=state.get("expected_cancellations", 0.0),
     )
     if manual_shock != 0:
         flags.append(f"Manual demand adjustment applied ({manual_shock * 100:+.0f}%)")
@@ -263,11 +330,40 @@ def rules_expert_node(state: AgentState):
         flags.append("Total demand adjustment was clamped to keep priced occupancy between 0% and 100%")
     if state.get("manual_event_text"):
         flags.append("Local intel context supplied")
+    raw_otb_occupancy = _safe_float(state.get("raw_otb_occupancy"), adjusted_otb_occupancy)
+    expected_cancellations = _safe_float(state.get("expected_cancellations"), 0.0)
+    if adjusted_otb_occupancy < raw_otb_occupancy:
+        flags.append(
+            f"Cancellation-adjusted OTB applied ({raw_otb_occupancy * 100:.1f}% raw -> {adjusted_otb_occupancy * 100:.1f}% retained; "
+            f"{expected_cancellations:.2f} expected room cancellations removed)"
+        )
+    optimizer_diagnostics = {
+        "reference_price": breakdown.get("reference_price"),
+        "raw_otb_occupancy": breakdown.get("raw_otb_occupancy"),
+        "adjusted_otb_occupancy": breakdown.get("adjusted_otb_occupancy"),
+        "expected_cancellations": breakdown.get("expected_cancellations"),
+        "pricing_occupancy": breakdown.get("pricing_occupancy"),
+        "demand_anchor": breakdown.get("demand_anchor"),
+        "elasticity": breakdown.get("elasticity"),
+        "selected_candidate": breakdown.get("selected_candidate"),
+        "expected_rooms": breakdown.get("expected_rooms"),
+        "expected_revenue": breakdown.get("expected_revenue"),
+        "competitor_gap_pct": breakdown.get("competitor_gap_pct"),
+        "review_flags": breakdown.get("review_flags", []),
+        "top_candidates": sorted(
+            breakdown.get("optimizer_candidates", []),
+            key=lambda row: row.get("expected_revenue", 0),
+            reverse=True,
+        )[:5],
+    }
     return {
+        "optimized_price": price,
+        "optimizer_price": price,
         "rule_based_price": price,
         "logic_flags": flags,
         "base_occupancy": sim_occ,
         "pricing_breakdown": breakdown,
+        "optimizer_diagnostics": optimizer_diagnostics,
         "manual_demand_shock": manual_shock,
         "local_intel_suggested_shock": _safe_float(local_estimate.get("suggested_shock"), state.get("local_intel_suggested_shock", 0.0)),
         "local_intel_applied_shock": local_intel_shock,
@@ -298,19 +394,23 @@ def pace_analyst_node(state: AgentState):
 def strategist_node(state: AgentState):
     pace_info = next((f for f in state['logic_flags'] if "Pace" in f), "Pace: Normal")
     non_pace_flags = [f for f in state["logic_flags"] if "Pace" not in f]
-    adjustment_band = _build_adjustment_band(state)
-    state["adjustment_band"] = adjustment_band
+    optimized_price = _safe_float(state.get("optimized_price"), MIN_PRICE)
+    breakdown = state.get("pricing_breakdown", {})
+    diagnostics = state.get("optimizer_diagnostics", {})
 
     system_message = (
-        "You are a Senior Hotel Revenue Strategy Reviewer. The deterministic pricing engine owns the baseline and guardrails. "
-        "Your job is to recommend a small, auditable strategy adjustment inside the provided band and explain it clearly. "
+        "You are a Senior Hotel Revenue Strategy Reviewer. The optimizer owns the price. "
+        "Your job is to review, explain, and flag risks. You must not change the ADR or propose a replacement price. "
         "You must output ONLY a valid JSON object. Do not include markdown formatting or thinking text."
     )
     
     prompt_data = {"current_occ":state['current_occupancy'] * 100,
                    "forecasted_occ":state['forecasted_occupancy'] * 100,
                    "inventory_status":state['current_occupancy']/max(state['forecasted_occupancy'], 0.01),
-                   "rule_based_price":state['rule_based_price'],
+                   "optimized_price": optimized_price,
+                   "reference_price": _safe_float(breakdown.get("reference_price"), BASE_PRICE),
+                   "expected_rooms": _safe_float(diagnostics.get("expected_rooms"), 0.0),
+                   "expected_revenue": _safe_float(diagnostics.get("expected_revenue"), 0.0),
                    "competitor_price":state['competitor_price'],
                    "booking_velocity":state['booking_velocity'],
                    "manual_demand_shock":state.get('manual_demand_shock', state.get('demand_shock', 0.0))* 100,
@@ -322,14 +422,27 @@ def strategist_node(state: AgentState):
                    "manual_event_text": state.get("manual_event_text", ""),
                    "pace":", ".join(non_pace_flags) if non_pace_flags else "No rule flags",
                    "pace_info":pace_info,
-                   "adjustment_min": adjustment_band["min_allowed"],
-                   "adjustment_max": adjustment_band["max_allowed"],
-                   "pricing_components": json.dumps(state.get("pricing_breakdown", {}).get("components", []))
+                   "pricing_components": json.dumps(breakdown.get("components", [])),
+                   "optimizer_diagnostics": json.dumps(diagnostics),
+                   "review_flags": json.dumps(diagnostics.get("review_flags", [])),
                    }
     
     user_prompt = load_prompt(STRATEGIST_PROMPT_PATH ,**prompt_data)
 
     try:
+        if not _resolve_api_key():
+            advisory_message = "AI advisory is unavailable because no DeepSeek API key is configured. Optimizer price retained."
+            return {
+                "ai_recommended_action": "Review Before Publishing",
+                "ai_risk_level": "Medium",
+                "ai_review_flags": [advisory_message],
+                "ai_owner_summary": advisory_message,
+                "strategy_applied": "Optimizer Only",
+                "perceived_demand_strength": "Medium",
+                "strategic_reasoning": advisory_message,
+                "adjustment_components": [],
+            }
+
         # API Call
         response = _get_client().chat.completions.create(
             model= CHAT_MODEL,
@@ -342,50 +455,99 @@ def strategist_node(state: AgentState):
         )
 
         ai_decision = json.loads(response.choices[0].message.content)
-        validated = _validate_ai_price(ai_decision, state)
-        final_adr = validated["final_adr"]
-        owner_summary = ai_decision.get("owner_summary") or ai_decision.get("reasoning") or "The baseline price was reviewed against demand, pace, market rate, and safety guardrails."
+        action = ai_decision.get("ai_recommended_action") or ai_decision.get("recommended_action") or "Accept Optimizer Price"
+        if action not in {"Accept Optimizer Price", "Review Before Publishing", "Hold For Manual Approval", "Investigate Data Quality"}:
+            action = "Review Before Publishing"
+        risk_level = ai_decision.get("ai_risk_level") or ai_decision.get("risk_level") or "Medium"
+        if risk_level not in {"Low", "Medium", "High"}:
+            risk_level = "Medium"
+        review_flags = ai_decision.get("ai_review_flags") or ai_decision.get("review_flags") or []
+        if not isinstance(review_flags, list):
+            review_flags = [str(review_flags)]
+        review_flags = _manager_friendly_flags(review_flags)
+        owner_summary = ai_decision.get("ai_owner_summary") or ai_decision.get("owner_summary") or "The optimizer price was reviewed against demand, pace, market rate, and safety guardrails."
         if state.get("manual_event_text") and state.get("local_intel_applied_shock", 0.0) == 0:
             owner_summary = "Local intel was considered as context only and was not included in the baseline price. " + owner_summary
+        if _needs_manager_rewrite(owner_summary):
+            owner_summary = _manager_summary(state, action)
 
-        result = {
-            **validated,
-            "strategy_applied": ai_decision.get("strategy_applied", "Guardrailed AI Review"),
-            "perceived_demand_strength": ai_decision.get("perceived_demand_strength", "Medium"),
+        return {
+            "ai_recommended_action": action,
+            "ai_risk_level": risk_level,
+            "ai_review_flags": review_flags,
+            "ai_owner_summary": owner_summary,
+            "strategy_applied": action,
+            "perceived_demand_strength": ai_decision.get("perceived_demand_strength", risk_level),
             "strategic_reasoning": owner_summary,
-            "adjustment_band": adjustment_band,
-            "price_components": _build_price_components(state, final_adr),
             "adjustment_components": ai_decision.get("adjustment_components", []),
-            "local_intel_estimate": state.get("local_intel_estimate", {}),
-            "manual_demand_shock": state.get("manual_demand_shock", state.get("demand_shock", 0.0)),
-            "local_intel_suggested_shock": state.get("local_intel_suggested_shock", 0.0),
-            "local_intel_applied_shock": state.get("local_intel_applied_shock", 0.0),
-            "total_demand_shock": state.get("total_demand_shock", state.get("demand_shock", 0.0)),
         }
-        return result
 
     except Exception as e:
-        # Robust Fallback to Rules
-        final_adr = state['rule_based_price']
+        fallback_reason = f"AI advisory unavailable: {str(e)} Optimizer price retained."
         return {
-            "final_adr": final_adr,
-            "absolute_delta": 0.0,
-            "pct_delta_from_baseline": 0.0,
-            "competitor_gap_pct": _pct(((final_adr - state['competitor_price']) / state['competitor_price']) * 100) if state.get("competitor_price") else 0.0,
-            "guardrails_applied": [f"Strategist Error: {str(e)}. Fallback to rule engine."],
-            "manual_approval_required": False,
-            "strategy_applied": "Rule-Based Fallback",
+            "ai_recommended_action": "Review Before Publishing",
+            "ai_risk_level": "Medium",
+            "ai_review_flags": [fallback_reason],
+            "ai_owner_summary": fallback_reason,
+            "strategy_applied": "Optimizer With AI Fallback",
             "perceived_demand_strength": "Medium",
-            "strategic_reasoning": f"Strategist Error: {str(e)}. Fallback to rule engine.",
-            "adjustment_band": adjustment_band,
-            "price_components": _build_price_components(state, final_adr),
+            "strategic_reasoning": fallback_reason,
             "adjustment_components": [],
-            "local_intel_estimate": state.get("local_intel_estimate", {}),
-            "manual_demand_shock": state.get("manual_demand_shock", state.get("demand_shock", 0.0)),
-            "local_intel_suggested_shock": state.get("local_intel_suggested_shock", 0.0),
-            "local_intel_applied_shock": state.get("local_intel_applied_shock", 0.0),
-            "total_demand_shock": state.get("total_demand_shock", state.get("demand_shock", 0.0)),
         }
+
+
+# --- NODE 4: DETERMINISTIC VALIDATION ---
+def validation_node(state: AgentState):
+    final_adr = _money(min(max(_safe_float(state.get("optimized_price"), MIN_PRICE), MIN_PRICE), MAX_PRICE))
+    breakdown = state.get("pricing_breakdown", {})
+    diagnostics = state.get("optimizer_diagnostics", {})
+    reference_price = _safe_float(breakdown.get("reference_price"), BASE_PRICE)
+    competitor_price = _safe_float(state.get("competitor_price"), 0.0)
+    absolute_delta = _money(final_adr - reference_price)
+    pct_delta = _pct((absolute_delta / reference_price) * 100) if reference_price else 0.0
+    competitor_gap = _pct(((final_adr - competitor_price) / competitor_price) * 100) if competitor_price else 0.0
+
+    deterministic_flags = list(diagnostics.get("review_flags", []))
+    local_estimate = state.get("local_intel_estimate") or {}
+    deterministic_flags.extend(local_estimate.get("guardrails_applied", []))
+    ai_flags = list(state.get("ai_review_flags", []))
+    guardrails = deterministic_flags + ai_flags
+
+    action = state.get("ai_recommended_action", "Accept Optimizer Price")
+    manual_approval_required = (
+        action in {"Hold For Manual Approval", "Investigate Data Quality"}
+        or state.get("ai_risk_level") == "High"
+        or abs(pct_delta) > 20
+        or abs(absolute_delta) > 30
+        or any("review" in str(flag).lower() for flag in deterministic_flags)
+    )
+
+    owner_summary = state.get("ai_owner_summary") or "Optimizer price retained after advisory review."
+    if _needs_manager_rewrite(owner_summary):
+        owner_summary = _manager_summary(state, action)
+
+    return {
+        "final_adr": final_adr,
+        "optimized_price": final_adr,
+        "optimizer_price": final_adr,
+        "rule_based_price": final_adr,
+        "absolute_delta": absolute_delta,
+        "pct_delta_from_reference": pct_delta,
+        "pct_delta_from_baseline": pct_delta,
+        "competitor_gap_pct": competitor_gap,
+        "guardrails_applied": guardrails,
+        "manual_approval_required": manual_approval_required,
+        "strategy_applied": action,
+        "strategic_reasoning": owner_summary,
+        "price_components": _build_price_path_components(state, final_adr),
+        "price_path_components": _build_price_path_components(state, final_adr),
+        "decision_context_components": _build_decision_context_components(state, final_adr),
+        "local_intel_estimate": state.get("local_intel_estimate", {}),
+        "manual_demand_shock": state.get("manual_demand_shock", state.get("demand_shock", 0.0)),
+        "local_intel_suggested_shock": state.get("local_intel_suggested_shock", 0.0),
+        "local_intel_applied_shock": state.get("local_intel_applied_shock", 0.0),
+        "total_demand_shock": state.get("total_demand_shock", state.get("demand_shock", 0.0)),
+    }
 
 # --- GRAPH ORCHESTRATION ---
 @lru_cache(maxsize=1)
@@ -393,15 +555,17 @@ def create_pricing_agent():
     builder = StateGraph(AgentState)
 
     builder.add_node("ingests_data", data_ingestion_node)
-    builder.add_node("apply_rules", rules_expert_node)
+    builder.add_node("optimize_price", optimizer_node)
     builder.add_node("analyze_pace", pace_analyst_node)
     builder.add_node("ai_strategist", strategist_node)
+    builder.add_node("validate_decision", validation_node)
 
     builder.set_entry_point("ingests_data")
-    builder.add_edge("ingests_data","apply_rules")
-    builder.add_edge("apply_rules", "analyze_pace")
+    builder.add_edge("ingests_data","optimize_price")
+    builder.add_edge("optimize_price", "analyze_pace")
     builder.add_edge("analyze_pace", "ai_strategist")
-    builder.add_edge("ai_strategist", END)
+    builder.add_edge("ai_strategist", "validate_decision")
+    builder.add_edge("validate_decision", END)
 
     return builder.compile()
 
@@ -419,21 +583,44 @@ def run_agentic_pricing(
     manual_demand_shock=None,
     local_intel_estimate=None,
     local_intel_applied_shock=0.0,
+    raw_otb_occupancy=None,
+    adjusted_otb_occupancy=None,
+    expected_cancellations=None,
 ):
     manual_shock = shock if manual_demand_shock is None else manual_demand_shock
     local_estimate = local_intel_estimate or {}
     local_suggested_shock = _safe_float(local_estimate.get("suggested_shock"), 0.0)
     local_applied_shock = _safe_float(local_intel_applied_shock, 0.0)
     total_shock = _safe_float(manual_shock, 0.0) + local_applied_shock
+    market_state = market_state or {}
+    total_rooms = max(_safe_float(market_state.get("total_rooms"), 0.0), 1.0)
+    inferred_raw_otb_occupancy = (
+        _safe_float(market_state.get("current_otb"), 0.0) / total_rooms
+        if market_state.get("current_otb") is not None
+        else current_occupancy
+    )
+    raw_occ = _safe_float(raw_otb_occupancy, inferred_raw_otb_occupancy)
+    adjusted_occ = _safe_float(
+        adjusted_otb_occupancy,
+        _safe_float(market_state.get("adjusted_otb_occupancy"), current_occupancy),
+    )
+    expected_cancel_rooms = (
+        _safe_float(expected_cancellations)
+        if expected_cancellations is not None
+        else _safe_float(market_state.get("expected_cancellations"), 0.0)
+    )
     agent = create_pricing_agent()
     result = agent.invoke({
         "target_date": target_date,
         "forecasted_occupancy": forecasted_occupancy,
-        "current_occupancy":current_occupancy,
+        "current_occupancy": adjusted_occ,
+        "raw_otb_occupancy": raw_occ,
+        "adjusted_otb_occupancy": adjusted_occ,
+        "expected_cancellations": expected_cancel_rooms,
         "competitor_price": competitor_price,
         "booking_velocity": booking_velocity,
         "historical_avg_otb": historical_avg_otb,
-        "market_state": market_state or {},
+        "market_state": market_state,
         "demand_shock": total_shock,
         "manual_demand_shock": manual_shock,
         "local_intel_suggested_shock": local_suggested_shock,

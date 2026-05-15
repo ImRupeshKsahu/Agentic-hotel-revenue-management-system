@@ -49,7 +49,9 @@ def load_model_metrics_cached(path, mtime):
 def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime, otb_mtime, forecast_mtime):
     if os.path.exists(json_path):
         with open(json_path, "r") as f:
-            return json.load(f)
+            cached_state = json.load(f)
+        if cached_state and all("adjusted_otb_occupancy" in entry for entry in cached_state.values()):
+            return cached_state
 
     if not os.path.exists(otb_path):
         return {}
@@ -80,6 +82,15 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime
 
         state[pd.to_datetime(row.Date).strftime("%Y-%m-%d")] = {
             "current_otb": int(getattr(row, "Live_OTB", 0)),
+            "adjusted_otb": float(getattr(row, "Adjusted_OTB", getattr(row, "Live_OTB", 0))),
+            "expected_cancellations": float(getattr(row, "Expected_Cancellations", 0.0)),
+            "adjusted_otb_occupancy": float(
+                getattr(
+                    row,
+                    "Adjusted_OTB_Occupancy",
+                    getattr(row, "Live_OTB", 0) / max(getattr(row, "Capacity", BASE_CAPACITY), 1),
+                )
+            ),
             "historical_avg_otb": int(getattr(row, "Historical_Avg_OTB", 1)),
             "competitor_price": round(float(competitor_price), 2),
             "total_rooms": int(getattr(row, "Capacity", BASE_CAPACITY)),
@@ -102,6 +113,15 @@ def load_live_market_data():
 
 def load_model_metrics():
     return load_model_metrics_cached(MODEL_COMPARISON_PATH, file_mtime(MODEL_COMPARISON_PATH))
+
+
+def adjusted_otb_occupancy(live_entry):
+    total_rooms = float(live_entry.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY)
+    if live_entry.get("adjusted_otb_occupancy") is not None:
+        return float(live_entry["adjusted_otb_occupancy"])
+    if live_entry.get("adjusted_otb") is not None:
+        return float(live_entry["adjusted_otb"]) / total_rooms
+    return float(live_entry.get("current_otb", 0)) / total_rooms
 
 # 4. Sidebar Navigation
 st.sidebar.header("🕹️ System Controls")
@@ -150,10 +170,14 @@ if app_mode == "📈 Market Performance":
         # )
 
         price, rules = calculate_recommended_price(
-            occupancy=max(float(live_entry.get('current_otb', 0)/BASE_CAPACITY), float(row['Forecasted_Occupancy'])),
+            occupancy=max(adjusted_otb_occupancy(live_entry), float(row['Forecasted_Occupancy'])),
             day_name=row['Date'].strftime('%A'),
             target_date=d_str,
-            competitor_price=live_entry.get('competitor_price', 120.0)
+            competitor_price=live_entry.get('competitor_price', 120.0),
+            booking_velocity=live_entry.get('booking_velocity', 1.0),
+            raw_otb_occupancy=float(live_entry.get('current_otb', 0)) / float(live_entry.get('total_rooms', BASE_CAPACITY) or BASE_CAPACITY),
+            adjusted_otb_occupancy=adjusted_otb_occupancy(live_entry),
+            expected_cancellations=live_entry.get('expected_cancellations', 0.0),
         )
         
         live_records.append({
@@ -225,6 +249,9 @@ else:
         d_str,
         {
             "current_otb": 50,
+            "adjusted_otb": 50.0,
+            "expected_cancellations": 0.0,
+            "adjusted_otb_occupancy": 50 / BASE_CAPACITY,
             "historical_avg_otb": 1,
             "competitor_price": 120.0,
             "booking_velocity": 1.0,
@@ -239,7 +266,8 @@ else:
     target_date_parsed = pd.to_datetime(target_date, format="%Y/%m/%d")
     result = forecast_df.loc[forecast_df["Date"] == target_date_parsed, "Forecasted_Occupancy"]
     forecasted_occ = float(result.iloc[0]) if not result.empty else float(current_state['current_otb'] / BASE_CAPACITY)
-    current_occ = float(current_state['current_otb'] / BASE_CAPACITY)
+    raw_current_occ = float(current_state['current_otb'] / BASE_CAPACITY)
+    current_occ = adjusted_otb_occupancy(current_state)
 
     local_intel_estimate = estimate_local_intel_impact(
         manual_event,
@@ -269,16 +297,16 @@ else:
     demand_shock = st.sidebar.slider("Manual Demand Adjustment (%)", -30, 30, 0) / 100.0
     local_intel_applied_shock = local_intel_estimate["suggested_shock"] if apply_local_intel else 0.0
     total_baseline_shock = demand_shock + local_intel_applied_shock
-    st.sidebar.caption(f"Total demand shock included in baseline: {total_baseline_shock * 100:+.1f}%")
+    st.sidebar.caption(f"Total demand shock included in optimizer: {total_baseline_shock * 100:+.1f}%")
 
     if st.sidebar.button("Execute Agentic Decision", type="primary"):
         # --- THE LIVE LOG ---
         log_placeholder = st.empty()
         with log_placeholder.container():
             st.write("🔍 **Node 1: Data Ingestion** - Using cached PMS-derived market snapshot...")
-            st.write("📐 **Node 2: Rules Expert** - Applying yield and competitor rules...")
+            st.write("📐 **Node 2: Price Optimizer** - Evaluating candidate ADRs and expected revenue...")
             st.write("📈 **Node 3: Pace Analyst** - Reading prepared booking velocity...")
-            st.write("🧠 **Node 4: AI Strategist** - Consulted DeepSeek. Evaluating market anomalies...")
+            st.write("🧠 **Node 4: AI Strategist** - Reviewing optimizer rationale and risk flags...")
 
         agent_result = run_agentic_pricing(
             target_date=d_str,
@@ -293,6 +321,9 @@ else:
             manual_demand_shock=demand_shock,
             local_intel_estimate=local_intel_estimate,
             local_intel_applied_shock=local_intel_applied_shock,
+            raw_otb_occupancy=raw_current_occ,
+            adjusted_otb_occupancy=current_occ,
+            expected_cancellations=float(current_state.get("expected_cancellations", 0.0)),
         )
 
         # Clear logs and show results
@@ -300,41 +331,62 @@ else:
         
         # Dashboard Metrics
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Final Agent ADR", f"${agent_result['final_adr']:.2f}")
-        c2.metric("Rules Baseline", f"${agent_result['rule_based_price']:.2f}")
-        c3.metric("AI Margin", f"{agent_result.get('pct_delta_from_baseline', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
+        c1.metric("Final ADR", f"${agent_result['final_adr']:.2f}")
+        c2.metric("Optimizer ADR", f"${agent_result.get('optimized_price', agent_result['rule_based_price']):.2f}")
+        c3.metric("Reference Delta", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
         c4.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
         c5.metric("Booking Pace", f"{agent_result['booking_velocity']}x")
 
         st.markdown("---")
         
         # Strategic Reasoner
-        st.subheader("🕵️ Agent Reasoning Trace")
+        st.subheader("AI Advisory Briefing")
+        action_label = agent_result.get("ai_recommended_action", agent_result.get("strategy_applied", "Review Before Publishing"))
+        risk_label = agent_result.get("ai_risk_level", "Medium")
+        banner_text = f"{action_label} | Risk: {risk_label}"
+        if action_label == "Accept Optimizer Price":
+            st.success(banner_text)
+        elif action_label in ["Hold For Manual Approval", "Investigate Data Quality"]:
+            st.error(banner_text)
+        else:
+            st.warning(banner_text)
         # st.success(agent_result['strategic_reasoning'])
-        st.success(normalize_reasoning(agent_result['strategic_reasoning']))
+        st.info(normalize_reasoning(agent_result['strategic_reasoning']))
         # Detailed Trace Expander
         with st.expander("Show Technical Node Trace"):
             st.write(f"**Applied Logic Flags:** {agent_result['logic_flags']}")
             st.write(f"**Forecasted Occupancy:** {agent_result['forecasted_occupancy']*100}%")
-            st.write(f"**Adjustment Band:** {agent_result.get('adjustment_band', {})}")
+            st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
+            st.write(f"**AI Recommended Action:** {agent_result.get('ai_recommended_action', 'n/a')}")
+            st.write(f"**AI Risk Level:** {agent_result.get('ai_risk_level', 'n/a')}")
+            st.write(f"**AI Review Flags:** {agent_result.get('ai_review_flags', [])}")
             st.write(f"**Local Intel Estimate:** {agent_result.get('local_intel_estimate', {})}")
             st.write(f"**Manual Demand Adjustment:** {agent_result.get('manual_demand_shock', 0) * 100:+.1f}%")
             st.write(f"**Local Intel Applied Adjustment:** {agent_result.get('local_intel_applied_shock', 0) * 100:+.1f}%")
-            st.write(f"**Total Baseline Demand Shock:** {agent_result.get('total_demand_shock', 0) * 100:+.1f}%")
+            st.write(f"**Total Optimizer Demand Shock:** {agent_result.get('total_demand_shock', 0) * 100:+.1f}%")
             st.write(f"**Guardrails Applied:** {agent_result.get('guardrails_applied', [])}")
             st.write(f"**Manual Approval Required:** {agent_result.get('manual_approval_required', False)}")
 
-        st.subheader("Price Composition Analysis")
-        price_components = agent_result.get("price_components", [])
-        if price_components:
-            st.dataframe(pd.DataFrame(price_components), use_container_width=True, hide_index=True)
+        st.subheader("Price Path")
+        price_path_components = agent_result.get("price_path_components", agent_result.get("price_components", []))
+        if price_path_components:
+            st.dataframe(pd.DataFrame(price_path_components), use_container_width=True, hide_index=True)
         else:
             fallback_rows = [
                 {"Driver": "Base rate", "Adjustment": "$+0.00", "Price After": f"${BASE_PRICE:.2f}", "Why": "Starting public rate."},
-                {"Driver": "Rule-based baseline", "Adjustment": f"${agent_result['rule_based_price'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['rule_based_price']:.2f}", "Why": "Deterministic pricing engine output."},
-                {"Driver": "AI-reviewed margin", "Adjustment": f"${agent_result['final_adr'] - agent_result['rule_based_price']:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Validated strategy adjustment."},
+                {"Driver": "Optimizer ADR", "Adjustment": f"${agent_result['final_adr'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Deterministic candidate-price optimizer output."},
             ]
             st.dataframe(pd.DataFrame(fallback_rows), use_container_width=True, hide_index=True)
+
+        st.subheader("Decision Context")
+        decision_context_components = agent_result.get("decision_context_components", [])
+        if decision_context_components:
+            st.dataframe(pd.DataFrame(decision_context_components), use_container_width=True, hide_index=True)
+        else:
+            fallback_context_rows = [
+                {"Signal": "AI advisory", "Value": "Review only", "Why it matters": "AI reviewed the decision without changing ADR."},
+            ]
+            st.dataframe(pd.DataFrame(fallback_context_rows), use_container_width=True, hide_index=True)
 
         guardrail_rows = [{"Guardrail": item} for item in agent_result.get("guardrails_applied", [])]
         if guardrail_rows:
