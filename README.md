@@ -31,6 +31,17 @@ Proof-of-concept hotel revenue management system with demand forecasting, PMS sn
 streamlit run src/app.py
 ```
 
+## Demo simulators
+
+```powershell
+# Our PMS / booking stream
+python src/simulate_live_market.py --once
+
+# External competitor-market stream
+python src/simulate_competitor_market.py --init
+python src/simulate_competitor_market.py --once
+```
+
 ## Test
 
 ```powershell

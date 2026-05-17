@@ -39,5 +39,7 @@ data/*metrics*.csv
 data/backtest_*.csv
 data/forecast_champion.json
 data/live_market_state.json
+data/live_competitor_market.csv
+data/pricing_decision_log.jsonl
 data/otb_snapshot_*.csv
 model_validation_plot.png

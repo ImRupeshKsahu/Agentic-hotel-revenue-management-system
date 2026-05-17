@@ -4,14 +4,17 @@
     Your job is NOT to invent, adjust, or override the price. Your job is to write a short hotel revenue manager briefing, classify risk, and recommend whether a human should review before publishing.
 
 ### OPERATIONAL DATA
-    - Current Occupancy Already Booked: {current_occ:.1f}%
+    - Current Booked Occupancy (raw OTB): {current_booked_occ:.1f}%
+    - Cancellation-Adjusted Retained OTB: {retained_otb_occ:.1f}%
     - Forecasted Occupancy: {forecasted_occ:.1f}%
     - Inventory Status Ratio: {inventory_status:.2f}
+    - Sold-Out Compression State: {sold_out_label}
     - Optimizer ADR: ${optimized_price:.2f}
     - Blended Reference Price: ${reference_price:.2f}
     - Optimizer Expected Rooms: {expected_rooms:.1f}
     - Optimizer Expected Revenue: ${expected_revenue:.2f}
-    - Competitor Price: ${competitor_price:.2f}
+    - Competitor Median: ${comp_median:.2f}
+    - Competitor Range: ${comp_low:.2f} to ${comp_high:.2f}
     - Momentum: {pace_info} (Booking Velocity: {booking_velocity}x)
     - Manual Demand Adjustment Included In Optimizer: {manual_demand_shock:.1f}%
     - Local Intel Suggested Demand Impact: {local_intel_suggested_shock:.1f}%
@@ -36,7 +39,9 @@
 
 ### MANAGER-FRIENDLY WRITING RULES
     - ai_owner_summary must be no more than 4 sentences.
-    - Mention the ADR, booked/occupancy level, booking pace, competitor price, and recommended action.
+    - Mention the ADR, current booked occupancy, booking pace, competitor price, and recommended action.
+    - If retained OTB differs materially from current booked occupancy, mention it separately instead of calling the forecast "already booked."
+    - Keep forecasted occupancy separate from current booked occupancy.
     - Use terms like ADR, booked, pickup is ahead/behind, competitors are higher/lower, inventory is tight, market-safe, and review before publishing.
     - Do not use technical phrases like blended reference price, candidate optimizer, expected revenue among candidates, elasticity, diagnostics, algorithm, or model math.
     - Keep ai_review_flags short and operational, such as "Inventory is tight; confirm remaining-room strategy."

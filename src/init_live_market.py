@@ -1,6 +1,7 @@
 import pandas as pd
 
 from config import BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, RAW_BOOKINGS_PATH
+from market_feed import ensure_competitor_market
 from pms_snapshot import calculate_otb_snapshot, export_live_market_state, load_booking_ledger
 from simulate_live_market import initialize_live_ledger
 
@@ -17,7 +18,17 @@ def initialize_market_file():
     except FileNotFoundError:
         competitor_rates = None
 
-    export_live_market_state(snapshot, competitor_rates=competitor_rates, output_path="data/live_market_state.json")
+    market_snapshot = ensure_competitor_market(
+        snapshot["Date"],
+        baseline_rates=competitor_rates,
+        as_of_timestamp=DATA_END_DATE,
+    )
+    export_live_market_state(
+        snapshot,
+        competitor_rates=competitor_rates,
+        market_snapshots=market_snapshot,
+        output_path="data/live_market_state.json",
+    )
     print("live_market_state.json exported from PMS-derived OTB snapshot.")
 
 

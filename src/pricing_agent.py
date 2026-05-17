@@ -2,12 +2,12 @@ import json
 import math
 import os
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
-from pricing_engine import calculate_recommended_price
-from config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE
+from pricing_engine import calculate_recommended_price, normalize_market_context
+from config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE, PRICING_DECISION_LOG_PATH
 from openai import OpenAI
 from utils.utility_functions import load_prompt
 import httpx
@@ -55,7 +55,9 @@ class AgentState(TypedDict):
     raw_otb_occupancy: float
     adjusted_otb_occupancy: float
     expected_cancellations: float
+    sold_out: bool
     competitor_price: float
+    market_context: Dict[str, Any]
     demand_shock: float
     manual_demand_shock: float
     local_intel_suggested_shock: float
@@ -139,8 +141,19 @@ def _sentence_count(text: str) -> int:
     return len([part for part in re.split(r"[.!?]+", without_decimal_points) if part.strip()])
 
 
-def _needs_manager_rewrite(summary: str) -> bool:
+def _needs_manager_rewrite(summary: str, state: AgentState | None = None) -> bool:
     normalized = (summary or "").lower()
+    if state:
+        raw_booked_occupancy = _safe_float(
+            state.get("raw_otb_occupancy"),
+            _safe_float(state.get("current_occupancy")),
+        )
+        retained_otb_occupancy = _safe_float(
+            state.get("adjusted_otb_occupancy"),
+            _safe_float(state.get("current_occupancy")),
+        )
+        if raw_booked_occupancy >= 0.9999 or abs(raw_booked_occupancy - retained_otb_occupancy) >= 0.05:
+            return True
     return (
         not normalized.strip()
         or any(term in normalized for term in TECHNICAL_SUMMARY_TERMS)
@@ -158,12 +171,23 @@ def _pace_phrase(booking_velocity: float) -> str:
 
 def _manager_summary(state: AgentState, action: str) -> str:
     adr = _safe_float(state.get("optimized_price"), MIN_PRICE)
-    occupancy = max(_safe_float(state.get("current_occupancy")), _safe_float(state.get("forecasted_occupancy")))
+    raw_booked_occupancy = _safe_float(
+        state.get("raw_otb_occupancy"),
+        _safe_float(state.get("current_occupancy")),
+    )
+    retained_otb_occupancy = _safe_float(
+        state.get("adjusted_otb_occupancy"),
+        _safe_float(state.get("current_occupancy")),
+    )
+    forecasted_occupancy = _safe_float(state.get("forecasted_occupancy"))
     booking_velocity = _safe_float(state.get("booking_velocity"), 1.0)
-    competitor_price = _safe_float(state.get("competitor_price"), 0.0)
+    market_context = state.get("market_context") or {}
+    competitor_price = _safe_float(market_context.get("comp_median"), _safe_float(state.get("competitor_price"), 0.0))
     competitor_phrase = (
         f"Competitors are priced at ${competitor_price:.2f}, so this ADR is still below the market."
-        if competitor_price and adr <= competitor_price
+        if competitor_price and adr < competitor_price
+        else f"Competitors are priced at ${competitor_price:.2f}, so this ADR is aligned with the market."
+        if competitor_price and abs(adr - competitor_price) < 0.01
         else f"Competitors are priced at ${competitor_price:.2f}, so confirm the premium fits your positioning."
         if competitor_price
         else "Competitor pricing is unavailable, so treat this as an internal demand-led recommendation."
@@ -175,9 +199,17 @@ def _manager_summary(state: AgentState, action: str) -> str:
         "Investigate Data Quality": "Investigate the data quality before publishing this ADR.",
     }.get(action, "Review before publishing to confirm the ADR fits your positioning and remaining-room strategy.")
 
+    occupancy_context = f"the hotel is currently {raw_booked_occupancy * 100:.1f}% booked"
+    if abs(raw_booked_occupancy - retained_otb_occupancy) >= 0.05:
+        occupancy_context += (
+            f"; after expected cancellations, retained OTB is {retained_otb_occupancy * 100:.1f}%"
+        )
+    if abs(raw_booked_occupancy - forecasted_occupancy) >= 0.01:
+        occupancy_context += f", while the forecast is {forecasted_occupancy * 100:.1f}%"
+
     return (
-        f"The recommended ADR is ${adr:.2f} because the hotel is already {occupancy * 100:.1f}% booked and {_pace_phrase(booking_velocity)}. "
-        f"{competitor_phrase} "
+        f"The recommended ADR is ${adr:.2f} because {occupancy_context}. "
+        f"{_pace_phrase(booking_velocity).capitalize()}, and {competitor_phrase[0].lower() + competitor_phrase[1:]} "
         f"{action_sentence}"
     )
 
@@ -227,9 +259,13 @@ def _build_price_path_components(state: AgentState, final_adr: float) -> List[Di
     breakdown = state.get("pricing_breakdown", {})
     reference_price = _safe_float(breakdown.get("reference_price"), _safe_float(state.get("rule_based_price"), MIN_PRICE))
 
+    component_drivers = ["Base rate", "Reference price", "Candidate optimization"]
+    if breakdown.get("sold_out"):
+        component_drivers.append("Sold-out floor")
+    component_drivers.append("Final recommendation")
     rows = [
         _format_component_row(_find_component(breakdown, driver))
-        for driver in ["Base rate", "Reference price", "Candidate optimization", "Final recommendation"]
+        for driver in component_drivers
     ]
     rows.append({
         "Driver": "Reference delta",
@@ -242,7 +278,18 @@ def _build_price_path_components(state: AgentState, final_adr: float) -> List[Di
 
 def _build_decision_context_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
     breakdown = state.get("pricing_breakdown", {})
-    context_rows = []
+    context_rows = [
+        {
+            "Signal": "Current booked occupancy",
+            "Value": f"{round(_safe_float(breakdown.get('raw_otb_occupancy'), 0.0) * 100)}%",
+            "Why it matters": "Raw OTB determines whether inventory is already sold out.",
+        },
+        {
+            "Signal": "Retained OTB after cancellations",
+            "Value": f"{round(_safe_float(breakdown.get('adjusted_otb_occupancy'), 0.0) * 100)}%",
+            "Why it matters": "Cancellation-adjusted OTB remains the demand signal used in pricing.",
+        },
+    ]
     for driver in ["Demand anchor", "Competitor signal"]:
         component = _find_component(breakdown, driver)
         context_rows.append({
@@ -260,6 +307,14 @@ def _build_decision_context_components(state: AgentState, final_adr: float) -> L
         })
 
     context_rows.append({
+        "Signal": "Market premium headroom",
+        "Value": f"{round(_safe_float(breakdown.get('allowed_premium_pct'), 0.0) * 100)}%",
+        "Why it matters": (
+            f"{str(breakdown.get('market_position_regime', 'unknown')).replace('_', ' ').title()} "
+            f"with compression score {_safe_float(breakdown.get('compression_score'), 0.0):.2f}."
+        ),
+    })
+    context_rows.append({
         "Signal": "AI advisory",
         "Value": "Review only",
         "Why it matters": "AI reviewed risks and explanation only; it did not change the optimizer price.",
@@ -275,7 +330,22 @@ def data_ingestion_node(state: AgentState):
     """
     date_data = state.get("market_state") or {}
     velocity = float(date_data.get("booking_velocity", state.get("booking_velocity", 1.0)))
-    competitor_price = float(date_data.get("competitor_price", state.get("competitor_price", 120.0)))
+    raw_market_context = {
+        "comp_low": date_data.get("comp_low"),
+        "comp_median": date_data.get("comp_median"),
+        "comp_high": date_data.get("comp_high"),
+        "sample_size": date_data.get("sample_size"),
+        "source_quality": date_data.get("source_quality"),
+        "market_regime": date_data.get("market_regime"),
+        "market_as_of_timestamp": date_data.get("market_as_of_timestamp"),
+    }
+    if not any(value is not None for value in raw_market_context.values()):
+        raw_market_context = state.get("market_context") or {}
+    market_context = normalize_market_context(
+        raw_market_context,
+        date_data.get("competitor_price", state.get("competitor_price", 120.0)),
+    )
+    competitor_price = float(market_context.get("comp_median") or state.get("competitor_price", 120.0))
     raw_otb_occupancy = _safe_float(date_data.get("raw_otb_occupancy"), _safe_float(state.get("raw_otb_occupancy"), 0.0))
     adjusted_otb_occupancy = _safe_float(
         date_data.get("adjusted_otb_occupancy"),
@@ -289,9 +359,11 @@ def data_ingestion_node(state: AgentState):
     return {
         "booking_velocity": velocity,
         "competitor_price": competitor_price,
+        "market_context": market_context,
         "raw_otb_occupancy": raw_otb_occupancy,
         "adjusted_otb_occupancy": adjusted_otb_occupancy,
         "expected_cancellations": expected_cancellations,
+        "sold_out": raw_otb_occupancy >= 0.9999,
     }
 
 # --- NODE 1: THE OPTIMIZER ---
@@ -309,6 +381,7 @@ def optimizer_node(state: AgentState):
         day_name=day_name,
         target_date= state["target_date"],
         competitor_price=state['competitor_price'],
+        market_context=state.get("market_context"),
         return_breakdown=True,
         pre_shock_occupancy=base_occ,
         manual_shock=manual_shock,
@@ -332,6 +405,9 @@ def optimizer_node(state: AgentState):
         flags.append("Local intel context supplied")
     raw_otb_occupancy = _safe_float(state.get("raw_otb_occupancy"), adjusted_otb_occupancy)
     expected_cancellations = _safe_float(state.get("expected_cancellations"), 0.0)
+    sold_out = bool(breakdown.get("sold_out"))
+    if sold_out:
+        flags.append("Sold-out compression regime active; raw OTB reached capacity.")
     if adjusted_otb_occupancy < raw_otb_occupancy:
         flags.append(
             f"Cancellation-adjusted OTB applied ({raw_otb_occupancy * 100:.1f}% raw -> {adjusted_otb_occupancy * 100:.1f}% retained; "
@@ -342,9 +418,20 @@ def optimizer_node(state: AgentState):
         "raw_otb_occupancy": breakdown.get("raw_otb_occupancy"),
         "adjusted_otb_occupancy": breakdown.get("adjusted_otb_occupancy"),
         "expected_cancellations": breakdown.get("expected_cancellations"),
+        "sold_out": breakdown.get("sold_out"),
+        "pricing_regime": breakdown.get("pricing_regime"),
+        "sold_out_floor_price": breakdown.get("sold_out_floor_price"),
+        "sold_out_floor_applied": breakdown.get("sold_out_floor_applied"),
+        "material_retention_gap": breakdown.get("material_retention_gap"),
         "pricing_occupancy": breakdown.get("pricing_occupancy"),
         "demand_anchor": breakdown.get("demand_anchor"),
         "elasticity": breakdown.get("elasticity"),
+        "market_context": breakdown.get("market_context"),
+        "compression_score": breakdown.get("compression_score"),
+        "allowed_premium_pct": breakdown.get("allowed_premium_pct"),
+        "market_position_regime": breakdown.get("market_position_regime"),
+        "comp_median_gap_pct": breakdown.get("comp_median_gap_pct"),
+        "comp_high_gap_pct": breakdown.get("comp_high_gap_pct"),
         "selected_candidate": breakdown.get("selected_candidate"),
         "expected_rooms": breakdown.get("expected_rooms"),
         "expected_revenue": breakdown.get("expected_revenue"),
@@ -361,6 +448,7 @@ def optimizer_node(state: AgentState):
         "optimizer_price": price,
         "rule_based_price": price,
         "logic_flags": flags,
+        "sold_out": sold_out,
         "base_occupancy": sim_occ,
         "pricing_breakdown": breakdown,
         "optimizer_diagnostics": optimizer_diagnostics,
@@ -404,14 +492,19 @@ def strategist_node(state: AgentState):
         "You must output ONLY a valid JSON object. Do not include markdown formatting or thinking text."
     )
     
-    prompt_data = {"current_occ":state['current_occupancy'] * 100,
+    prompt_data = {"current_booked_occ":state['raw_otb_occupancy'] * 100,
+                   "retained_otb_occ":state['adjusted_otb_occupancy'] * 100,
                    "forecasted_occ":state['forecasted_occupancy'] * 100,
-                   "inventory_status":state['current_occupancy']/max(state['forecasted_occupancy'], 0.01),
+                   "inventory_status":state['raw_otb_occupancy']/max(state['forecasted_occupancy'], 0.01),
+                   "sold_out_label":"Yes" if state.get("sold_out") else "No",
                    "optimized_price": optimized_price,
                    "reference_price": _safe_float(breakdown.get("reference_price"), BASE_PRICE),
                    "expected_rooms": _safe_float(diagnostics.get("expected_rooms"), 0.0),
                    "expected_revenue": _safe_float(diagnostics.get("expected_revenue"), 0.0),
                    "competitor_price":state['competitor_price'],
+                   "comp_low": _safe_float((state.get("market_context") or {}).get("comp_low"), 0.0),
+                   "comp_median": _safe_float((state.get("market_context") or {}).get("comp_median"), 0.0),
+                   "comp_high": _safe_float((state.get("market_context") or {}).get("comp_high"), 0.0),
                    "booking_velocity":state['booking_velocity'],
                    "manual_demand_shock":state.get('manual_demand_shock', state.get('demand_shock', 0.0))* 100,
                    "local_intel_suggested_shock":state.get('local_intel_suggested_shock', 0.0)* 100,
@@ -468,7 +561,7 @@ def strategist_node(state: AgentState):
         owner_summary = ai_decision.get("ai_owner_summary") or ai_decision.get("owner_summary") or "The optimizer price was reviewed against demand, pace, market rate, and safety guardrails."
         if state.get("manual_event_text") and state.get("local_intel_applied_shock", 0.0) == 0:
             owner_summary = "Local intel was considered as context only and was not included in the baseline price. " + owner_summary
-        if _needs_manager_rewrite(owner_summary):
+        if _needs_manager_rewrite(owner_summary, state):
             owner_summary = _manager_summary(state, action)
 
         return {
@@ -523,7 +616,7 @@ def validation_node(state: AgentState):
     )
 
     owner_summary = state.get("ai_owner_summary") or "Optimizer price retained after advisory review."
-    if _needs_manager_rewrite(owner_summary):
+    if _needs_manager_rewrite(owner_summary, state):
         owner_summary = _manager_summary(state, action)
 
     return {
@@ -542,6 +635,7 @@ def validation_node(state: AgentState):
         "price_components": _build_price_path_components(state, final_adr),
         "price_path_components": _build_price_path_components(state, final_adr),
         "decision_context_components": _build_decision_context_components(state, final_adr),
+        "market_context": state.get("market_context", {}),
         "local_intel_estimate": state.get("local_intel_estimate", {}),
         "manual_demand_shock": state.get("manual_demand_shock", state.get("demand_shock", 0.0)),
         "local_intel_suggested_shock": state.get("local_intel_suggested_shock", 0.0),
@@ -577,6 +671,7 @@ def run_agentic_pricing(
     shock,
     manual_event_text="",
     competitor_price=120.0,
+    market_context=None,
     booking_velocity=1.0,
     historical_avg_otb=1,
     market_state=None,
@@ -586,6 +681,7 @@ def run_agentic_pricing(
     raw_otb_occupancy=None,
     adjusted_otb_occupancy=None,
     expected_cancellations=None,
+    record_decision=True,
 ):
     manual_shock = shock if manual_demand_shock is None else manual_demand_shock
     local_estimate = local_intel_estimate or {}
@@ -609,6 +705,19 @@ def run_agentic_pricing(
         if expected_cancellations is not None
         else _safe_float(market_state.get("expected_cancellations"), 0.0)
     )
+    resolved_market_context = normalize_market_context(
+        market_context or {
+            "comp_low": market_state.get("comp_low"),
+            "comp_median": market_state.get("comp_median"),
+            "comp_high": market_state.get("comp_high"),
+            "sample_size": market_state.get("sample_size"),
+            "source_quality": market_state.get("source_quality"),
+            "market_regime": market_state.get("market_regime"),
+            "market_as_of_timestamp": market_state.get("market_as_of_timestamp"),
+        },
+        competitor_price,
+    )
+    competitor_price = _safe_float(resolved_market_context.get("comp_median"), competitor_price)
     agent = create_pricing_agent()
     result = agent.invoke({
         "target_date": target_date,
@@ -617,7 +726,9 @@ def run_agentic_pricing(
         "raw_otb_occupancy": raw_occ,
         "adjusted_otb_occupancy": adjusted_occ,
         "expected_cancellations": expected_cancel_rooms,
+        "sold_out": raw_occ >= 0.9999,
         "competitor_price": competitor_price,
+        "market_context": resolved_market_context,
         "booking_velocity": booking_velocity,
         "historical_avg_otb": historical_avg_otb,
         "market_state": market_state,
@@ -629,7 +740,34 @@ def run_agentic_pricing(
         "local_intel_estimate": local_estimate,
         "manual_event_text": manual_event_text
     })
+    if record_decision:
+        _append_pricing_decision_log(result)
     return result
+
+
+def _append_pricing_decision_log(result: Dict[str, Any]) -> None:
+    breakdown = result.get("pricing_breakdown", {})
+    diagnostics = result.get("optimizer_diagnostics", {})
+    payload = {
+        "logged_at": datetime.now(UTC).isoformat(),
+        "target_date": result.get("target_date"),
+        "forecasted_occupancy": result.get("forecasted_occupancy"),
+        "raw_otb_occupancy": result.get("raw_otb_occupancy"),
+        "adjusted_otb_occupancy": result.get("adjusted_otb_occupancy"),
+        "booking_velocity": result.get("booking_velocity"),
+        "market_context": result.get("market_context") or breakdown.get("market_context"),
+        "selected_adr": result.get("final_adr"),
+        "compression_score": breakdown.get("compression_score"),
+        "allowed_premium_pct": breakdown.get("allowed_premium_pct"),
+        "market_position_regime": breakdown.get("market_position_regime"),
+        "selected_candidate": diagnostics.get("selected_candidate"),
+        "top_candidates": diagnostics.get("top_candidates"),
+        "observed_rooms_sold": None,
+        "observed_revenue": None,
+    }
+    os.makedirs(os.path.dirname(PRICING_DECISION_LOG_PATH), exist_ok=True)
+    with open(PRICING_DECISION_LOG_PATH, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(payload) + "\n")
 
 if __name__ == "__main__":
     result = run_agentic_pricing(target_date="2017-09-23",current_occupancy=0.958,forecasted_occupancy=1,shock=0.0)

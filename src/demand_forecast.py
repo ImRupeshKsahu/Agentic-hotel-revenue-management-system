@@ -4,18 +4,24 @@ import os
 import pandas as pd
 
 from config import (
+    BACKTEST_AUDIT_FOLD_METRICS_PATH,
+    BACKTEST_AUDIT_INTERVAL_COVERAGE_PATH,
+    BACKTEST_AUDIT_LAG_METRICS_PATH,
+    BACKTEST_AUDIT_PREDICTIONS_PATH,
+    BACKTEST_AUDIT_SUMMARY_PATH,
     BACKTEST_CADENCE_DAYS,
     BACKTEST_FOLD_METRICS_PATH,
     BACKTEST_LAG_METRICS_PATH,
     BACKTEST_PREDICTIONS_PATH,
-    BACKTEST_SCENARIO_LAGS,
     BACKTEST_SCENARIO_METRICS_PATH,
+    BACKTEST_TIMELINE_PATH,
     BASE_CAPACITY,
     DATA_END_DATE,
     DATA_PATH,
     FORECAST_CHAMPION_PATH,
     FORECAST_HORIZON_DAYS,
     FORECAST_OUTPUT_PATH,
+    LIVE_COMPETITOR_MARKET_PATH,
     LIVE_DATA_PATH,
     METRICS_PATH,
     MODEL_COMPARISON_PATH,
@@ -25,6 +31,7 @@ from config import (
 )
 from data_pipeline import refresh_daily_hotel_data
 from forecasting import load_champion, run_backtest_and_save, run_forecast_and_save
+from market_feed import initialize_competitor_market
 from pms_snapshot import calculate_otb_snapshot, export_live_market_state, load_booking_ledger
 from simulate_live_market import initialize_live_ledger
 
@@ -50,8 +57,14 @@ def _artifact_paths():
         "scenario_metrics": BACKTEST_SCENARIO_METRICS_PATH,
         "predictions": BACKTEST_PREDICTIONS_PATH,
         "fold_metrics": BACKTEST_FOLD_METRICS_PATH,
+        "audit_predictions": BACKTEST_AUDIT_PREDICTIONS_PATH,
+        "audit_fold_metrics": BACKTEST_AUDIT_FOLD_METRICS_PATH,
+        "audit_summary": BACKTEST_AUDIT_SUMMARY_PATH,
+        "audit_lag_metrics": BACKTEST_AUDIT_LAG_METRICS_PATH,
+        "audit_interval_coverage": BACKTEST_AUDIT_INTERVAL_COVERAGE_PATH,
         "champion": FORECAST_CHAMPION_PATH,
         "plots_dir": PLOTS_DIR,
+        "timeline_plot": BACKTEST_TIMELINE_PATH,
     }
 
 
@@ -81,7 +94,18 @@ def _seed_live_pms_and_otb(forecast_df):
         capacity=BASE_CAPACITY,
     )
     _safe_to_csv(otb_snapshot, OTB_SNAPSHOT_PATH, index=False)
-    export_live_market_state(otb_snapshot, competitor_rates=forecast_df, output_path="data/live_market_state.json")
+    market_snapshot = initialize_competitor_market(
+        otb_snapshot["Date"],
+        baseline_rates=forecast_df,
+        as_of_timestamp=DATA_END_DATE,
+        output_path=LIVE_COMPETITOR_MARKET_PATH,
+    )
+    export_live_market_state(
+        otb_snapshot,
+        competitor_rates=forecast_df,
+        market_snapshots=market_snapshot,
+        output_path="data/live_market_state.json",
+    )
 
 
 def run_backtest_mode():
@@ -93,7 +117,6 @@ def run_backtest_mode():
         daily_df,
         paths=_artifact_paths(),
         horizon=FORECAST_HORIZON_DAYS,
-        scenario_lags=BACKTEST_SCENARIO_LAGS,
     )
     _seed_live_pms_and_otb(forecast_df)
     _print_summary(forecast_df, metrics_df, champion, mode="backtest")

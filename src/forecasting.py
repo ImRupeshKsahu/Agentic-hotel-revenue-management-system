@@ -1,7 +1,7 @@
 import json
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 import numpy as np
@@ -37,6 +37,11 @@ except Exception:
 
 DEFAULT_HORIZON = 30
 DEFAULT_SCENARIO_LAGS = [10, 14, 21, 30, 32, 45, 60, 90, 120]
+DEFAULT_BACKTEST_STEP_DAYS = 7
+DEFAULT_MIN_TRAIN_DAYS = 365
+DEFAULT_AUDIT_FOLDS = 8
+DEFAULT_INTERVAL_LEVEL = 0.90
+DEFAULT_AUDIT_DRIFT_THRESHOLD = 0.25
 
 STATISTICAL_MODELS = [
     "naive",
@@ -119,6 +124,9 @@ class ForecastChampion:
     metrics: dict
     feature_schema: list[str]
     backtest_cadence_days: int = 7
+    interval_level: float = DEFAULT_INTERVAL_LEVEL
+    interval_quantiles: dict = field(default_factory=dict)
+    backtest_metadata: dict = field(default_factory=dict)
 
 
 def _actuals(daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -135,7 +143,9 @@ def _actuals(daily_df: pd.DataFrame) -> pd.DataFrame:
     }.items():
         if col not in df.columns:
             df[col] = default
-    df["Competitor_Rate"] = df["Competitor_Rate"].ffill().bfill().fillna(120.0)
+    # Use only past information when filling historical covariates. Backfilling from
+    # later rows would let earlier training windows borrow knowledge from the future.
+    df["Competitor_Rate"] = df["Competitor_Rate"].ffill().fillna(120.0)
     df["Booking_Pace"] = df["Booking_Pace"].fillna(0)
     return df
 
@@ -192,7 +202,6 @@ def _future_dates(history: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
 def _sarimax_exog(df: pd.DataFrame) -> pd.DataFrame:
     dates = pd.to_datetime(df["Date"])
-    competitor_rate = pd.to_numeric(df.get("Competitor_Rate", 120.0), errors="coerce").ffill().bfill().fillna(120.0)
     local_event = pd.to_numeric(df.get("Local_Event", 0), errors="coerce").fillna(0)
     is_weekend = dates.dt.dayofweek.isin([5, 6]).astype(int)
 
@@ -204,7 +213,6 @@ def _sarimax_exog(df: pd.DataFrame) -> pd.DataFrame:
             "month_sin": np.sin(2 * np.pi * dates.dt.month / 12),
             "month_cos": np.cos(2 * np.pi * dates.dt.month / 12),
             "local_event": local_event.astype(float),
-            "competitor_rate_scaled": competitor_rate.astype(float) / 100.0,
         },
         index=df.index,
     )
@@ -239,7 +247,6 @@ def _feature_vector(history: pd.DataFrame, future: pd.DataFrame, horizon: int = 
     features["trend_14"] = features["roll_mean_14"] - features["roll_mean_56"]
     features["recent_min_28"] = float(y.tail(28).min())
     features["recent_max_28"] = float(y.tail(28).max())
-    features["recent_competitor_rate"] = float(history["Competitor_Rate"].tail(14).mean())
     features["recent_booking_pace"] = float(history["Booking_Pace"].tail(14).mean())
     features["recent_cancellations"] = float(history["Cancellations"].tail(14).mean())
     features.update(_calendar_features(pd.to_datetime(history["Date"].iloc[-1]), "origin"))
@@ -255,7 +262,6 @@ def _feature_vector(history: pd.DataFrame, future: pd.DataFrame, horizon: int = 
         prefix = f"h{i}"
         features.update(_calendar_features(date, prefix))
         features[f"{prefix}_local_event"] = float(row.get("Local_Event", 0))
-        features[f"{prefix}_competitor_rate"] = float(row.get("Competitor_Rate", features["recent_competitor_rate"]))
     return features
 
 
@@ -265,9 +271,10 @@ def _build_chain_training(history: pd.DataFrame, horizon: int, min_history: int 
     max_origin = len(history) - horizon - 1
     for origin_idx in range(min_history, max_origin + 1):
         origin_history = history.iloc[: origin_idx + 1].copy()
-        future = history.iloc[origin_idx + 1 : origin_idx + 1 + horizon].copy()
-        rows.append(_feature_vector(origin_history, future, horizon=horizon))
-        targets.append(future["Occupancy_Rate"].to_numpy())
+        realized_future = history.iloc[origin_idx + 1 : origin_idx + 1 + horizon].copy()
+        planned_future = _future_dates(origin_history, horizon)
+        rows.append(_feature_vector(origin_history, planned_future, horizon=horizon))
+        targets.append(realized_future["Occupancy_Rate"].to_numpy())
     if not rows:
         return pd.DataFrame(), np.empty((0, horizon)), []
     x = pd.DataFrame(rows).replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -280,7 +287,8 @@ def _build_recursive_training(history: pd.DataFrame, min_history: int = 90):
     for target_idx in range(min_history + 1, len(history)):
         origin_history = history.iloc[:target_idx].copy()
         target_row = history.iloc[[target_idx]].copy()
-        rows.append(_feature_vector(origin_history, target_row, horizon=1))
+        planned_future = _future_dates(origin_history, 1)
+        rows.append(_feature_vector(origin_history, planned_future, horizon=1))
         targets.append(float(target_row["Occupancy_Rate"].iloc[0]))
     if not rows:
         return pd.DataFrame(), np.array([]), []
@@ -429,18 +437,81 @@ def predict_model(history: pd.DataFrame, horizon: int, model_name: str):
     return np.clip(_predict_statistical(history, horizon, "rolling_mean_7"), 0, 1), []
 
 
-def _scenario_cutoffs(df: pd.DataFrame, scenario_lags: Iterable[int], horizon: int) -> list[tuple[int, pd.Timestamp]]:
+def _generate_weekly_folds(
+    df: pd.DataFrame,
+    horizon: int,
+    min_train_days: int = DEFAULT_MIN_TRAIN_DAYS,
+    step_days: int = DEFAULT_BACKTEST_STEP_DAYS,
+    audit_folds: int = DEFAULT_AUDIT_FOLDS,
+) -> pd.DataFrame:
+    max_date = pd.to_datetime(df["Date"].max())
+    min_date = pd.to_datetime(df["Date"].min())
+    last_full_cutoff = max_date - pd.Timedelta(days=horizon)
+    earliest_cutoff = min_date + pd.Timedelta(days=min_train_days)
+
+    cutoffs = []
+    cutoff = last_full_cutoff
+    while cutoff >= earliest_cutoff:
+        actual_future = df[(df["Date"].gt(cutoff)) & (df["Date"].le(cutoff + pd.Timedelta(days=horizon)))]
+        if len(actual_future) == horizon:
+            cutoffs.append(cutoff)
+        cutoff -= pd.Timedelta(days=step_days)
+    cutoffs = list(reversed(cutoffs))
+
+    if not cutoffs:
+        return pd.DataFrame(
+            columns=[
+                "Fold_ID",
+                "Cutoff",
+                "Split",
+                "Train_Start",
+                "Train_End",
+                "Validation_Start",
+                "Validation_End",
+            ]
+        )
+
+    effective_audit_folds = min(max(int(audit_folds), 0), max(len(cutoffs) - 1, 0))
+    rows = []
+    for idx, cutoff in enumerate(cutoffs, start=1):
+        split = "audit" if idx > len(cutoffs) - effective_audit_folds else "selection"
+        rows.append(
+            {
+                "Fold_ID": f"fold_{idx:03d}",
+                "Cutoff": cutoff,
+                "Split": split,
+                "Train_Start": min_date,
+                "Train_End": cutoff,
+                "Validation_Start": cutoff + pd.Timedelta(days=1),
+                "Validation_End": cutoff + pd.Timedelta(days=horizon),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _scenario_folds(df: pd.DataFrame, scenario_lags: Iterable[int], horizon: int) -> pd.DataFrame:
     max_date = df["Date"].max()
     min_date = df["Date"].min()
-    cutoffs = []
-    for lag in scenario_lags:
+    rows = []
+    for idx, lag in enumerate(scenario_lags, start=1):
         cutoff = max_date - pd.Timedelta(days=int(lag))
         if cutoff <= min_date + pd.Timedelta(days=120):
             continue
-        available = len(df[(df["Date"].gt(cutoff)) & (df["Date"].le(cutoff + pd.Timedelta(days=horizon)))])
-        if available > 0:
-            cutoffs.append((int(lag), cutoff))
-    return cutoffs
+        actual_future = df[(df["Date"].gt(cutoff)) & (df["Date"].le(cutoff + pd.Timedelta(days=horizon)))]
+        if len(actual_future) != horizon:
+            continue
+        rows.append(
+            {
+                "Fold_ID": f"scenario_{idx:03d}",
+                "Cutoff": cutoff,
+                "Split": "selection",
+                "Train_Start": min_date,
+                "Train_End": cutoff,
+                "Validation_Start": cutoff + pd.Timedelta(days=1),
+                "Validation_End": cutoff + pd.Timedelta(days=horizon),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _metrics_from_predictions(predictions: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -455,24 +526,131 @@ def _metrics_from_predictions(predictions: pd.DataFrame, group_cols: list[str]) 
     return pd.DataFrame(rows)
 
 
+def _aggregate_fold_metrics(fold_metrics: pd.DataFrame, split: str) -> pd.DataFrame:
+    subset = fold_metrics[fold_metrics["Split"].eq(split)].copy()
+    if subset.empty:
+        return pd.DataFrame()
+    metric_cols = ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "Bias", "Accuracy", "Volatility", "Stability"]
+    grouped = (
+        subset.groupby(["Model", "Strategy"], as_index=False)
+        .agg(
+            Folds=("Fold_ID", "nunique"),
+            Observations=("Observations", "sum"),
+            **{col: (col, "mean") for col in metric_cols},
+        )
+    )
+    return grouped
+
+
+def _calibrate_interval_quantiles(
+    predictions: pd.DataFrame,
+    model_name: str,
+    interval_level: float = DEFAULT_INTERVAL_LEVEL,
+) -> tuple[pd.DataFrame, dict]:
+    model_predictions = predictions[predictions["Model"].eq(model_name)].copy()
+    if model_predictions.empty:
+        return pd.DataFrame(), {}
+
+    residual = model_predictions["Actual"] - model_predictions["Predicted"]
+    model_predictions["Residual"] = residual
+    alpha = max(0.0, min(1.0, 1 - interval_level))
+    lower_q = alpha / 2
+    upper_q = 1 - alpha / 2
+    quantiles = (
+        model_predictions.groupby("Lag")["Residual"]
+        .quantile([lower_q, upper_q])
+        .unstack()
+        .rename(columns={lower_q: "Lower_Residual", upper_q: "Upper_Residual"})
+        .reset_index()
+        .sort_values("Lag")
+    )
+    payload = {
+        str(int(row.Lag)): {
+            "lower_residual": float(row.Lower_Residual),
+            "upper_residual": float(row.Upper_Residual),
+        }
+        for row in quantiles.itertuples(index=False)
+    }
+    return quantiles, payload
+
+
+def _interval_bounds_for_lag(prediction: float, lag: int, interval_quantiles: dict) -> tuple[float, float]:
+    quantile = interval_quantiles.get(str(int(lag))) or interval_quantiles.get(int(lag))
+    if not quantile:
+        return float("nan"), float("nan")
+    lower = float(np.clip(prediction + float(quantile["lower_residual"]), 0, 1))
+    upper = float(np.clip(prediction + float(quantile["upper_residual"]), 0, 1))
+    return lower, upper
+
+
+def _interval_coverage(predictions: pd.DataFrame, model_name: str, interval_quantiles: dict) -> pd.DataFrame:
+    model_predictions = predictions[predictions["Model"].eq(model_name)].copy()
+    if model_predictions.empty or not interval_quantiles:
+        return pd.DataFrame()
+    bounds = model_predictions.apply(
+        lambda row: _interval_bounds_for_lag(row["Predicted"], int(row["Lag"]), interval_quantiles),
+        axis=1,
+        result_type="expand",
+    )
+    model_predictions[["Lower_Bound", "Upper_Bound"]] = bounds
+    model_predictions["Covered"] = (
+        model_predictions["Actual"].ge(model_predictions["Lower_Bound"])
+        & model_predictions["Actual"].le(model_predictions["Upper_Bound"])
+    )
+    coverage = model_predictions.groupby("Lag", as_index=False).agg(
+        Observations=("Covered", "size"),
+        Interval_Coverage=("Covered", "mean"),
+    )
+    return coverage
+
+
+def _audit_status(
+    selection_mean_wape: float,
+    audit_mean_wape: float,
+    drift_threshold: float = DEFAULT_AUDIT_DRIFT_THRESHOLD,
+) -> tuple[float, str]:
+    drift_ratio = (
+        float(audit_mean_wape / selection_mean_wape)
+        if np.isfinite(selection_mean_wape) and selection_mean_wape > 0 and np.isfinite(audit_mean_wape)
+        else np.nan
+    )
+    status = (
+        "recent_degradation_flagged"
+        if np.isfinite(drift_ratio) and drift_ratio > 1 + drift_threshold
+        else "ok"
+    )
+    return drift_ratio, status
+
+
 def run_backtest_detailed(
     daily_df: pd.DataFrame,
     models: Optional[Iterable[str]] = None,
     horizon: int = DEFAULT_HORIZON,
     scenario_lags: Optional[Iterable[int]] = None,
+    min_train_days: int = DEFAULT_MIN_TRAIN_DAYS,
+    step_days: int = DEFAULT_BACKTEST_STEP_DAYS,
+    audit_folds: int = DEFAULT_AUDIT_FOLDS,
 ):
     df = _actuals(daily_df)
     models = list(models or DEFAULT_MODELS)
-    scenario_lags = list(scenario_lags or DEFAULT_SCENARIO_LAGS)
-    scenarios = _scenario_cutoffs(df, scenario_lags, horizon)
+    folds = (
+        _scenario_folds(df, list(scenario_lags), horizon)
+        if scenario_lags is not None
+        else _generate_weekly_folds(df, horizon, min_train_days=min_train_days, step_days=step_days, audit_folds=audit_folds)
+    )
 
     prediction_rows = []
-    for scenario_lag, cutoff in scenarios:
+    for fold in folds.itertuples(index=False):
+        cutoff = pd.to_datetime(fold.Cutoff)
         train = df[df["Date"].le(cutoff)].copy()
         actual_future = df[(df["Date"].gt(cutoff)) & (df["Date"].le(cutoff + pd.Timedelta(days=horizon)))].copy()
-        if actual_future.empty:
+        if len(actual_future) != horizon:
             continue
-        print(f"Backtest scenario: train through {cutoff.date()} ({scenario_lag} days back), validate {len(actual_future)} days", flush=True)
+        print(
+            f"Backtest fold {fold.Fold_ID}: train through {cutoff.date()} "
+            f"({fold.Split}), validate {len(actual_future)} days",
+            flush=True,
+        )
         for model_name in models:
             print(f"  fitting {model_name}", flush=True)
             preds, _ = predict_model(train, horizon, model_name)
@@ -483,7 +661,8 @@ def run_backtest_detailed(
                     {
                         "Model": model_name,
                         "Strategy": _strategy_for_model(model_name),
-                        "Scenario_Lag": scenario_lag,
+                        "Fold_ID": fold.Fold_ID,
+                        "Split": fold.Split,
                         "Cutoff": cutoff,
                         "Lag": lag_idx + 1,
                         "Date": actual_row["Date"],
@@ -493,14 +672,15 @@ def run_backtest_detailed(
                 )
 
     predictions = pd.DataFrame(prediction_rows)
-    overall = _metrics_from_predictions(predictions, ["Model", "Strategy"])
-    lag_metrics = _metrics_from_predictions(predictions, ["Model", "Strategy", "Lag"])
-    scenario_metrics = _metrics_from_predictions(predictions, ["Model", "Strategy", "Scenario_Lag", "Cutoff"])
+    fold_metrics = _metrics_from_predictions(predictions, ["Split", "Fold_ID", "Model", "Strategy", "Cutoff"])
+    overall = _aggregate_fold_metrics(fold_metrics, split="selection")
+    lag_metrics = _metrics_from_predictions(predictions[predictions["Split"].eq("selection")], ["Model", "Strategy", "Lag"])
+    scenario_metrics = fold_metrics.copy()
     if not overall.empty:
         overall["Abs_Bias"] = overall["Bias"].abs()
         overall["Complexity"] = overall["Model"].map(MODEL_COMPLEXITY).fillna(5)
         overall = overall.sort_values(["WAPE", "Abs_Bias", "RMSE", "Complexity"], ascending=[True, True, True, True])
-    return overall, lag_metrics, scenario_metrics, predictions
+    return overall, lag_metrics, scenario_metrics, predictions, fold_metrics, folds
 
 
 def select_champion(overall_metrics: pd.DataFrame, horizon: int, feature_schema: list[str] | None = None) -> ForecastChampion:
@@ -533,6 +713,9 @@ def save_champion(champion: ForecastChampion, path: str):
                 "metrics": champion.metrics,
                 "feature_schema": champion.feature_schema,
                 "backtest_cadence_days": champion.backtest_cadence_days,
+                "interval_level": champion.interval_level,
+                "interval_quantiles": champion.interval_quantiles,
+                "backtest_metadata": champion.backtest_metadata,
             },
             f,
             indent=4,
@@ -549,6 +732,9 @@ def load_champion(path: str, default_horizon: int = DEFAULT_HORIZON) -> Forecast
             selected_at=pd.Timestamp.now().isoformat(),
             metrics={},
             feature_schema=[],
+            interval_level=DEFAULT_INTERVAL_LEVEL,
+            interval_quantiles={},
+            backtest_metadata={},
         )
     with open(path, "r") as f:
         data = json.load(f)
@@ -560,6 +746,9 @@ def load_champion(path: str, default_horizon: int = DEFAULT_HORIZON) -> Forecast
         metrics=data.get("metrics", {}),
         feature_schema=data.get("feature_schema", []),
         backtest_cadence_days=int(data.get("backtest_cadence_days", 7)),
+        interval_level=float(data.get("interval_level", DEFAULT_INTERVAL_LEVEL)),
+        interval_quantiles=data.get("interval_quantiles", {}),
+        backtest_metadata=data.get("backtest_metadata", {}),
     )
 
 
@@ -567,15 +756,23 @@ def forecast_demand(
     daily_df: pd.DataFrame,
     selected_model: str = "seasonal_naive_7",
     horizon_days: int = DEFAULT_HORIZON,
+    interval_quantiles: Optional[dict] = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     history = _actuals(daily_df)
     preds, feature_schema = predict_model(history, horizon_days, selected_model)
     future = _future_dates(history, horizon_days)
     future["Forecasted_Occupancy"] = np.clip(preds, 0, 1)
-    residual_std = history["Occupancy_Rate"].diff().dropna().std()
-    residual_std = 0.08 if pd.isna(residual_std) else float(residual_std)
-    future["Min_Occupancy"] = (future["Forecasted_Occupancy"] - residual_std).clip(lower=0)
-    future["Max_Occupancy"] = (future["Forecasted_Occupancy"] + residual_std).clip(upper=1)
+    if interval_quantiles:
+        bounds = [
+            _interval_bounds_for_lag(float(pred), lag + 1, interval_quantiles)
+            for lag, pred in enumerate(future["Forecasted_Occupancy"])
+        ]
+        future[["Min_Occupancy", "Max_Occupancy"]] = pd.DataFrame(bounds, index=future.index)
+    else:
+        residual_std = history["Occupancy_Rate"].diff().dropna().std()
+        residual_std = 0.08 if pd.isna(residual_std) else float(residual_std)
+        future["Min_Occupancy"] = (future["Forecasted_Occupancy"] - residual_std).clip(lower=0)
+        future["Max_Occupancy"] = (future["Forecasted_Occupancy"] + residual_std).clip(upper=1)
     future["Selected_Model"] = selected_model
     return future[["Date", "Forecasted_Occupancy", "Min_Occupancy", "Max_Occupancy", "Competitor_Rate", "Selected_Model"]], feature_schema
 
@@ -642,15 +839,15 @@ def _plot_backtest_scenario(predictions: pd.DataFrame, plots_dir: str):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    latest_scenario = predictions["Scenario_Lag"].min()
-    latest = predictions[predictions["Scenario_Lag"].eq(latest_scenario)].copy()
+    latest_cutoff = pd.to_datetime(predictions["Cutoff"]).max()
+    latest = predictions[pd.to_datetime(predictions["Cutoff"]).eq(latest_cutoff)].copy()
     actual = latest[["Date", "Actual"]].drop_duplicates().sort_values("Date")
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.plot(actual["Date"], actual["Actual"], label="Actual", color="#111111", linewidth=3)
     for model_name, model_df in latest.groupby("Model"):
         model_df = model_df.sort_values("Date")
         ax.plot(model_df["Date"], model_df["Predicted"], label=model_name, linewidth=1.6, alpha=0.85)
-    ax.set_title(f"Actuals + Backtest Predictions ({int(latest_scenario)} days back)")
+    ax.set_title(f"Actuals + Backtest Predictions (latest fold ending {latest_cutoff.date()})")
     ax.set_xlabel("Date")
     ax.set_ylabel("Occupancy Rate")
     ax.set_ylim(0, 1.05)
@@ -659,6 +856,86 @@ def _plot_backtest_scenario(predictions: pd.DataFrame, plots_dir: str):
     fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(os.path.join(plots_dir, "backtest_models_latest_scenario.png"), dpi=180)
+    plt.close(fig)
+
+
+def _plot_backtest_timeline(folds: pd.DataFrame, output_path: str):
+    if folds.empty:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plot_folds = folds.copy().reset_index(drop=True)
+    fig_height = max(8, min(16, len(plot_folds) * 0.18))
+    fig, ax = plt.subplots(figsize=(16, fig_height))
+
+    for idx, row in plot_folds.iterrows():
+        y = len(plot_folds) - idx
+        train_start = mdates.date2num(pd.to_datetime(row["Train_Start"]))
+        train_end = mdates.date2num(pd.to_datetime(row["Train_End"]))
+        val_start = mdates.date2num(pd.to_datetime(row["Validation_Start"]))
+        val_end = mdates.date2num(pd.to_datetime(row["Validation_End"]))
+        edge = "#7b3fc6" if row["Split"] == "audit" else "none"
+        linewidth = 1.3 if row["Split"] == "audit" else 0
+        ax.broken_barh([(train_start, train_end - train_start)], (y - 0.35, 0.7), facecolors="#cfead6")
+        ax.broken_barh(
+            [(val_start, val_end - val_start)],
+            (y - 0.35, 0.7),
+            facecolors="#ffe7a8",
+            edgecolors=edge,
+            linewidth=linewidth,
+        )
+
+    audit_rows = plot_folds[plot_folds["Split"].eq("audit")]
+    if not audit_rows.empty:
+        audit_start_idx = int(audit_rows.index.min())
+        y_top = len(plot_folds) - audit_start_idx + 0.5
+        ax.axhspan(0.5, y_top, color="#efe6fb", alpha=0.35, zorder=-1)
+        ax.text(
+            pd.to_datetime(plot_folds["Validation_End"]).max(),
+            y_top - 0.35,
+            "audit folds",
+            color="#6b2fb3",
+            ha="right",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    ax.set_title("Weekly Rolling-Origin Backtest for a 30-Day Forecast Horizon", fontsize=15, weight="bold")
+    ax.set_xlabel("Calendar time")
+    ax.set_ylabel("Weekly folds")
+    ax.set_yticks([])
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.grid(axis="x", alpha=0.2)
+    ax.legend(
+        handles=[
+            Patch(facecolor="#cfead6", label="expanding training history"),
+            Patch(facecolor="#ffe7a8", label="30-day forecast window"),
+            Patch(facecolor="#efe6fb", label="reserved audit region"),
+        ],
+        loc="upper left",
+    )
+    ax.text(
+        0.99,
+        0.02,
+        "One WAPE per fold → mean fold WAPE by model",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=11,
+        color="#333333",
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#cccccc"},
+    )
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
 
@@ -684,14 +961,56 @@ def run_backtest_and_save(
     scenario_lags: Optional[Iterable[int]] = None,
     models: Optional[Iterable[str]] = None,
 ):
-    overall, lag_metrics, scenario_metrics, predictions = run_backtest_detailed(
+    overall, lag_metrics, scenario_metrics, predictions, fold_metrics, folds = run_backtest_detailed(
         daily_df,
         models=models,
         horizon=horizon,
         scenario_lags=scenario_lags,
     )
     champion = select_champion(overall, horizon=horizon)
-    forecast, feature_schema = forecast_demand(daily_df, selected_model=champion.model, horizon_days=horizon)
+    selection_predictions = predictions[predictions["Split"].eq("selection")].copy()
+    audit_predictions = predictions[predictions["Split"].eq("audit")].copy()
+    audit_fold_metrics = fold_metrics[fold_metrics["Split"].eq("audit")].copy()
+    audit_summary = _aggregate_fold_metrics(audit_fold_metrics, split="audit")
+    audit_lag_metrics = _metrics_from_predictions(audit_predictions, ["Model", "Strategy", "Lag"])
+
+    _, interval_quantiles = _calibrate_interval_quantiles(
+        selection_predictions,
+        champion.model,
+        interval_level=DEFAULT_INTERVAL_LEVEL,
+    )
+    audit_interval_coverage = _interval_coverage(audit_predictions, champion.model, interval_quantiles)
+    audit_interval_coverage_overall = (
+        float(
+            audit_interval_coverage["Interval_Coverage"].mul(audit_interval_coverage["Observations"]).sum()
+            / audit_interval_coverage["Observations"].sum()
+        )
+        if not audit_interval_coverage.empty
+        else np.nan
+    )
+
+    selection_mean_wape = float(champion.metrics.get("WAPE", np.nan))
+    champion_audit_row = audit_summary[audit_summary["Model"].eq(champion.model)]
+    audit_mean_wape = float(champion_audit_row["WAPE"].iloc[0]) if not champion_audit_row.empty else np.nan
+    audit_drift_ratio, audit_status = _audit_status(selection_mean_wape, audit_mean_wape)
+    if not audit_summary.empty:
+        audit_summary["Is_Champion"] = audit_summary["Model"].eq(champion.model)
+        audit_summary["Selection_Mean_Fold_WAPE"] = np.nan
+        audit_summary["Audit_Drift_Ratio"] = np.nan
+        audit_summary["Audit_Status"] = ""
+        audit_summary["Interval_Coverage"] = np.nan
+        champion_mask = audit_summary["Is_Champion"]
+        audit_summary.loc[champion_mask, "Selection_Mean_Fold_WAPE"] = selection_mean_wape
+        audit_summary.loc[champion_mask, "Audit_Drift_Ratio"] = audit_drift_ratio
+        audit_summary.loc[champion_mask, "Audit_Status"] = audit_status
+        audit_summary.loc[champion_mask, "Interval_Coverage"] = audit_interval_coverage_overall
+
+    forecast, feature_schema = forecast_demand(
+        daily_df,
+        selected_model=champion.model,
+        horizon_days=horizon,
+        interval_quantiles=interval_quantiles,
+    )
     champion = ForecastChampion(
         model=champion.model,
         strategy=champion.strategy,
@@ -700,6 +1019,21 @@ def run_backtest_and_save(
         metrics=champion.metrics,
         feature_schema=feature_schema,
         backtest_cadence_days=champion.backtest_cadence_days,
+        interval_level=DEFAULT_INTERVAL_LEVEL,
+        interval_quantiles=interval_quantiles,
+        backtest_metadata={
+            "fold_step_days": DEFAULT_BACKTEST_STEP_DAYS,
+            "min_train_days": DEFAULT_MIN_TRAIN_DAYS,
+            "total_folds": int(len(folds)),
+            "selection_folds": int(folds["Split"].eq("selection").sum()) if not folds.empty else 0,
+            "audit_folds": int(folds["Split"].eq("audit").sum()) if not folds.empty else 0,
+            "audit_drift_threshold": DEFAULT_AUDIT_DRIFT_THRESHOLD,
+            "audit_status": audit_status,
+            "selection_mean_fold_wape": selection_mean_wape,
+            "audit_mean_fold_wape": audit_mean_wape,
+            "audit_drift_ratio": audit_drift_ratio,
+            "audit_interval_coverage": audit_interval_coverage_overall,
+        },
     )
 
     os.makedirs(os.path.dirname(paths["forecast"]), exist_ok=True)
@@ -709,16 +1043,27 @@ def run_backtest_and_save(
     lag_metrics.to_csv(paths["lag_metrics"], index=False)
     scenario_metrics.to_csv(paths["scenario_metrics"], index=False)
     predictions.to_csv(paths["predictions"], index=False)
-    scenario_metrics.to_csv(paths["fold_metrics"], index=False)
+    fold_metrics.to_csv(paths["fold_metrics"], index=False)
+    audit_predictions.to_csv(paths["audit_predictions"], index=False)
+    audit_fold_metrics.to_csv(paths["audit_fold_metrics"], index=False)
+    audit_summary.to_csv(paths["audit_summary"], index=False)
+    audit_lag_metrics.to_csv(paths["audit_lag_metrics"], index=False)
+    audit_interval_coverage.to_csv(paths["audit_interval_coverage"], index=False)
     save_champion(champion, paths["champion"])
     save_forecast_plots(daily_df, forecast, champion.model, lag_metrics, predictions, paths["plots_dir"])
+    _plot_backtest_timeline(folds, paths["timeline_plot"])
     return forecast, overall, champion
 
 
 def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DEFAULT_HORIZON):
     champion = load_champion(paths["champion"], default_horizon=horizon)
-    forecast, feature_schema = forecast_demand(daily_df, selected_model=champion.model, horizon_days=champion.horizon)
-    if feature_schema and not champion.feature_schema:
+    forecast, feature_schema = forecast_demand(
+        daily_df,
+        selected_model=champion.model,
+        horizon_days=champion.horizon,
+        interval_quantiles=champion.interval_quantiles,
+    )
+    if feature_schema and feature_schema != champion.feature_schema:
         champion = ForecastChampion(
             model=champion.model,
             strategy=champion.strategy,
@@ -727,6 +1072,9 @@ def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DE
             metrics=champion.metrics,
             feature_schema=feature_schema,
             backtest_cadence_days=champion.backtest_cadence_days,
+            interval_level=champion.interval_level,
+            interval_quantiles=champion.interval_quantiles,
+            backtest_metadata=champion.backtest_metadata,
         )
         save_champion(champion, paths["champion"])
     os.makedirs(os.path.dirname(paths["forecast"]), exist_ok=True)
@@ -738,7 +1086,7 @@ def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DE
 # Backward-compatible wrappers used by older app/scripts.
 def run_backtest(daily_df: pd.DataFrame, models: Optional[Iterable[str]] = None, horizons=(7, 14, 30), cutoffs="rolling"):
     horizon = max(horizons) if horizons else DEFAULT_HORIZON
-    overall, _, _, _ = run_backtest_detailed(daily_df, models=models, horizon=horizon)
+    overall, _, _, _, _, _ = run_backtest_detailed(daily_df, models=models, horizon=horizon)
     return overall
 
 
@@ -751,8 +1099,14 @@ def save_forecast_artifacts(daily_df: pd.DataFrame, forecast_path: str, metrics_
         "scenario_metrics": os.path.join(os.path.dirname(comparison_path), "backtest_scenario_metrics.csv"),
         "predictions": os.path.join(os.path.dirname(comparison_path), "backtest_predictions.csv"),
         "fold_metrics": os.path.join(os.path.dirname(comparison_path), "backtest_fold_metrics.csv"),
+        "audit_predictions": os.path.join(os.path.dirname(comparison_path), "backtest_audit_predictions.csv"),
+        "audit_fold_metrics": os.path.join(os.path.dirname(comparison_path), "backtest_audit_fold_metrics.csv"),
+        "audit_summary": os.path.join(os.path.dirname(comparison_path), "backtest_audit_summary.csv"),
+        "audit_lag_metrics": os.path.join(os.path.dirname(comparison_path), "backtest_audit_lag_metrics.csv"),
+        "audit_interval_coverage": os.path.join(os.path.dirname(comparison_path), "backtest_audit_interval_coverage.csv"),
         "champion": os.path.join(os.path.dirname(comparison_path), "forecast_champion.json"),
         "plots_dir": plots_dir or os.path.join(os.path.dirname(comparison_path), "plots"),
+        "timeline_plot": os.path.join(os.path.dirname(os.path.dirname(comparison_path)), "docs", "backtest_timeline_explainer.png"),
     }
     forecast, metrics, _ = run_backtest_and_save(daily_df, paths)
     return forecast, metrics

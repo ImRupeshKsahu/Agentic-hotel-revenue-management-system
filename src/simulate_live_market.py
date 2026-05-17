@@ -7,6 +7,7 @@ import pandas as pd
 
 from config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, LIVE_MARKET_STATE_PATH, OTB_SNAPSHOT_PATH, RAW_BOOKINGS_PATH
 from data_pipeline import normalize_bookings
+from market_feed import ensure_competitor_market
 from pms_snapshot import calculate_otb_snapshot, export_live_market_state
 
 
@@ -27,9 +28,15 @@ def refresh_live_market_artifacts(ledger, as_of_date=DATA_END_DATE):
     except FileNotFoundError:
         competitor_rates = None
 
+    market_snapshot = ensure_competitor_market(
+        snapshot["Date"],
+        baseline_rates=competitor_rates,
+        as_of_timestamp=as_of_date,
+    )
     export_live_market_state(
         snapshot,
         competitor_rates=competitor_rates,
+        market_snapshots=market_snapshot,
         output_path=LIVE_MARKET_STATE_PATH,
     )
     return snapshot

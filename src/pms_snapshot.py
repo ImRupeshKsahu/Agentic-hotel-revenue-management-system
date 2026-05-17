@@ -127,13 +127,55 @@ def load_live_otb_snapshot(
     return calculate_otb_snapshot(bookings, as_of_date=as_of_date, horizon_days=horizon_days, capacity=capacity)
 
 
-def export_live_market_state(snapshot_df: pd.DataFrame, competitor_rates: Optional[pd.DataFrame] = None, output_path: str = None):
+def export_live_market_state(
+    snapshot_df: pd.DataFrame,
+    competitor_rates: Optional[pd.DataFrame] = None,
+    market_snapshots: Optional[pd.DataFrame] = None,
+    output_path: str = None,
+):
     df = snapshot_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
     if competitor_rates is not None:
         rates = competitor_rates[["Date", "Competitor_Rate"]].copy()
         rates["Date"] = pd.to_datetime(rates["Date"])
         df = df.merge(rates, on="Date", how="left")
-    df["Competitor_Rate"] = df.get("Competitor_Rate", pd.Series(dtype=float)).fillna(df["OTB_ADR"]).fillna(120.0)
+
+    if market_snapshots is not None and not market_snapshots.empty:
+        market = market_snapshots.copy()
+        market["Date"] = pd.to_datetime(market["stay_date"])
+        keep = [
+            "Date",
+            "as_of_timestamp",
+            "comp_low",
+            "comp_median",
+            "comp_high",
+            "sample_size",
+            "source_quality",
+            "market_regime",
+        ]
+        df = df.merge(market[keep], on="Date", how="left")
+
+    if "Competitor_Rate" not in df.columns:
+        df["Competitor_Rate"] = np.nan
+    df["Competitor_Rate"] = df["Competitor_Rate"].fillna(df["OTB_ADR"]).fillna(120.0)
+    for column in ["comp_median", "comp_low", "comp_high"]:
+        if column not in df.columns:
+            df[column] = np.nan
+    df["comp_median"] = df["comp_median"].fillna(df["Competitor_Rate"])
+    df["comp_low"] = df["comp_low"].fillna(df["comp_median"])
+    df["comp_high"] = df["comp_high"].fillna(df["comp_median"])
+    if "sample_size" not in df.columns:
+        df["sample_size"] = np.nan
+    df["sample_size"] = df["sample_size"].fillna(1).astype(int)
+    if "source_quality" not in df.columns:
+        df["source_quality"] = pd.NA
+    if "market_regime" not in df.columns:
+        df["market_regime"] = pd.NA
+    if "as_of_timestamp" not in df.columns:
+        df["as_of_timestamp"] = pd.NA
+    df["source_quality"] = df["source_quality"].fillna("legacy_single_rate")
+    df["market_regime"] = df["market_regime"].fillna("legacy_single_rate")
+    df["as_of_timestamp"] = df["as_of_timestamp"].fillna(pd.Timestamp(DATA_END_DATE).isoformat())
 
     state = {}
     for row in df.itertuples(index=False):
@@ -144,11 +186,19 @@ def export_live_market_state(snapshot_df: pd.DataFrame, competitor_rates: Option
             status = "Behind historical pace"
         state[pd.to_datetime(row.Date).strftime("%Y-%m-%d")] = {
             "current_otb": int(row.Live_OTB),
+            "raw_otb_occupancy": round(float(row.OTB_Occupancy), 4),
             "adjusted_otb": round(float(getattr(row, "Adjusted_OTB", row.Live_OTB)), 2),
             "expected_cancellations": round(float(getattr(row, "Expected_Cancellations", 0.0)), 2),
             "adjusted_otb_occupancy": round(float(getattr(row, "Adjusted_OTB_Occupancy", row.Live_OTB / row.Capacity)), 4),
             "historical_avg_otb": int(row.Historical_Avg_OTB),
-            "competitor_price": round(float(row.Competitor_Rate), 2),
+            "competitor_price": round(float(row.comp_median), 2),
+            "comp_low": round(float(row.comp_low), 2),
+            "comp_median": round(float(row.comp_median), 2),
+            "comp_high": round(float(row.comp_high), 2),
+            "sample_size": int(row.sample_size),
+            "source_quality": str(row.source_quality),
+            "market_regime": str(row.market_regime),
+            "market_as_of_timestamp": str(row.as_of_timestamp),
             "total_rooms": int(row.Capacity),
             "booking_velocity": float(row.Booking_Velocity),
             "status": status,

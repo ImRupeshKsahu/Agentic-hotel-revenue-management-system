@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import timedelta
 from plotly.subplots import make_subplots
-from config import BASE_PRICE,BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_MARKET_STATE_PATH, MODEL_COMPARISON_PATH, OTB_SNAPSHOT_PATH
+from config import BASE_PRICE,BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_COMPETITOR_MARKET_PATH, LIVE_MARKET_STATE_PATH, MODEL_COMPARISON_PATH, OTB_SNAPSHOT_PATH
 from pricing_engine import calculate_recommended_price
 from pricing_agent import run_agentic_pricing
 from local_intel_estimator import estimate_local_intel_impact
@@ -46,11 +46,23 @@ def load_model_metrics_cached(path, mtime):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime, otb_mtime, forecast_mtime):
+def load_live_market_state_cached(json_path, otb_path, forecast_path, market_path, json_mtime, otb_mtime, forecast_mtime, market_mtime):
     if os.path.exists(json_path):
         with open(json_path, "r") as f:
             cached_state = json.load(f)
         if cached_state and all("adjusted_otb_occupancy" in entry for entry in cached_state.values()):
+            for entry in cached_state.values():
+                total_rooms = float(entry.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY)
+                entry.setdefault(
+                    "raw_otb_occupancy",
+                    float(entry.get("current_otb", 0)) / total_rooms,
+                )
+                entry.setdefault("comp_low", entry.get("competitor_price"))
+                entry.setdefault("comp_median", entry.get("competitor_price"))
+                entry.setdefault("comp_high", entry.get("competitor_price"))
+                entry.setdefault("sample_size", 1)
+                entry.setdefault("source_quality", "legacy_single_rate")
+                entry.setdefault("market_regime", "legacy_single_rate")
             return cached_state
 
     if not os.path.exists(otb_path):
@@ -64,6 +76,25 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime
         forecast_rates["Date"] = pd.to_datetime(forecast_rates["Date"])
         if "Competitor_Rate" in forecast_rates.columns:
             otb_df = otb_df.merge(forecast_rates[["Date", "Competitor_Rate"]], on="Date", how="left")
+    if os.path.exists(market_path):
+        market_df = pd.read_csv(market_path)
+        market_df["Date"] = pd.to_datetime(market_df["stay_date"])
+        otb_df = otb_df.merge(
+            market_df[
+                [
+                    "Date",
+                    "as_of_timestamp",
+                    "comp_low",
+                    "comp_median",
+                    "comp_high",
+                    "sample_size",
+                    "source_quality",
+                    "market_regime",
+                ]
+            ],
+            on="Date",
+            how="left",
+        )
 
     state = {}
     for row in otb_df.itertuples(index=False):
@@ -79,9 +110,19 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime
             competitor_price = getattr(row, "OTB_ADR", pd.NA)
         if pd.isna(competitor_price):
             competitor_price = 120.0
+        comp_median = getattr(row, "comp_median", competitor_price)
+        if pd.isna(comp_median):
+            comp_median = competitor_price
+        comp_low = getattr(row, "comp_low", comp_median)
+        if pd.isna(comp_low):
+            comp_low = comp_median
+        comp_high = getattr(row, "comp_high", comp_median)
+        if pd.isna(comp_high):
+            comp_high = comp_median
 
         state[pd.to_datetime(row.Date).strftime("%Y-%m-%d")] = {
             "current_otb": int(getattr(row, "Live_OTB", 0)),
+            "raw_otb_occupancy": float(getattr(row, "Live_OTB", 0)) / max(getattr(row, "Capacity", BASE_CAPACITY), 1),
             "adjusted_otb": float(getattr(row, "Adjusted_OTB", getattr(row, "Live_OTB", 0))),
             "expected_cancellations": float(getattr(row, "Expected_Cancellations", 0.0)),
             "adjusted_otb_occupancy": float(
@@ -92,7 +133,14 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, json_mtime
                 )
             ),
             "historical_avg_otb": int(getattr(row, "Historical_Avg_OTB", 1)),
-            "competitor_price": round(float(competitor_price), 2),
+            "competitor_price": round(float(comp_median), 2),
+            "comp_low": round(float(comp_low), 2),
+            "comp_median": round(float(comp_median), 2),
+            "comp_high": round(float(comp_high), 2),
+            "sample_size": int(getattr(row, "sample_size", 1) if not pd.isna(getattr(row, "sample_size", 1)) else 1),
+            "source_quality": getattr(row, "source_quality", "legacy_single_rate"),
+            "market_regime": getattr(row, "market_regime", "legacy_single_rate"),
+            "market_as_of_timestamp": getattr(row, "as_of_timestamp", None),
             "total_rooms": int(getattr(row, "Capacity", BASE_CAPACITY)),
             "booking_velocity": velocity,
             "status": status,
@@ -105,9 +153,11 @@ def load_live_market_data():
         LIVE_MARKET_STATE_PATH,
         OTB_SNAPSHOT_PATH,
         FORECAST_OUTPUT_PATH,
+        LIVE_COMPETITOR_MARKET_PATH,
         file_mtime(LIVE_MARKET_STATE_PATH),
         file_mtime(OTB_SNAPSHOT_PATH),
         file_mtime(FORECAST_OUTPUT_PATH),
+        file_mtime(LIVE_COMPETITOR_MARKET_PATH),
     )
 
 
@@ -122,6 +172,10 @@ def adjusted_otb_occupancy(live_entry):
     if live_entry.get("adjusted_otb") is not None:
         return float(live_entry["adjusted_otb"]) / total_rooms
     return float(live_entry.get("current_otb", 0)) / total_rooms
+
+
+def humanize_label(value):
+    return str(value).replace("_", " ").strip().title()
 
 # 4. Sidebar Navigation
 st.sidebar.header("🕹️ System Controls")
@@ -144,12 +198,14 @@ if app_mode == "📈 Market Performance":
     if not metrics_df.empty:
         best = metrics_df.sort_values(["WAPE", "RMSE"]).iloc[0]
         if "Horizon" in best.index:
-            best_label = f"{best['Model']} / {int(best['Horizon'])}d"
+            best_label = f"{humanize_label(best['Model'])} / {int(best['Horizon'])}d"
         elif "Strategy" in best.index:
-            best_label = f"{best['Model']} ({best['Strategy']})"
+            best_label = humanize_label(best["Model"])
         else:
-            best_label = str(best["Model"])
+            best_label = humanize_label(best["Model"])
         c3.metric("Best Model", best_label)
+        if "Strategy" in best.index:
+            c3.caption(f"Strategy: {humanize_label(best['Strategy'])}")
         c4.metric("Backtest WAPE", f"{best['WAPE']:.1f}%")
     else:
         c3.metric("Best Model", "Run forecast")
@@ -223,11 +279,11 @@ if app_mode == "📈 Market Performance":
 
     # Strategy Table
     st.subheader("📅 Live 30-Day Strategy Feed")
-    st.dataframe(pd.DataFrame(live_records), use_container_width=True, height=400)
+    st.dataframe(pd.DataFrame(live_records), use_container_width=True, height=400, hide_index=True)
 
     if not metrics_df.empty:
         st.subheader("Forecast Model Backtesting")
-        st.dataframe(metrics_df, use_container_width=True, height=260)
+        st.dataframe(metrics_df, use_container_width=True, height=260, hide_index=True)
 
 # ==========================================
 # PAGE 2: AGENTIC SIMULATION (The "Thinking" View)
@@ -249,6 +305,7 @@ else:
         d_str,
         {
             "current_otb": 50,
+            "raw_otb_occupancy": 50 / BASE_CAPACITY,
             "adjusted_otb": 50.0,
             "expected_cancellations": 0.0,
             "adjusted_otb_occupancy": 50 / BASE_CAPACITY,
@@ -259,7 +316,21 @@ else:
         },
     )
 
-    st.sidebar.info(f"Current Live OTB: {current_state['current_otb']} | Comp Price: ${current_state['competitor_price']}")
+    st.sidebar.info(
+        f"Current Live OTB: {current_state['current_otb']} | "
+        f"Comp Set: ${current_state.get('comp_low', current_state['competitor_price']):.2f}"
+        f" / ${current_state.get('comp_median', current_state['competitor_price']):.2f}"
+        f" / ${current_state.get('comp_high', current_state['competitor_price']):.2f}"
+    )
+    st.sidebar.caption(
+        f"Market regime: {current_state.get('market_regime', 'n/a').replace('_', ' ').title()} | "
+        f"Source: {current_state.get('source_quality', 'n/a')}"
+    )
+    with st.sidebar.expander("Scenario-only market override"):
+        override_market = st.checkbox("Override market feed for this run", value=False)
+        override_low = st.number_input("Comp low", value=float(current_state.get("comp_low", current_state["competitor_price"])))
+        override_median = st.number_input("Comp median", value=float(current_state.get("comp_median", current_state["competitor_price"])))
+        override_high = st.number_input("Comp high", value=float(current_state.get("comp_high", current_state["competitor_price"])))
     st.sidebar.subheader("Local Intel")
     manual_event = st.sidebar.text_input("Enter local event (e.g., '100-person wedding block')")
 
@@ -300,6 +371,15 @@ else:
     st.sidebar.caption(f"Total demand shock included in optimizer: {total_baseline_shock * 100:+.1f}%")
 
     if st.sidebar.button("Execute Agentic Decision", type="primary"):
+        market_context = {
+            "comp_low": override_low if override_market else current_state.get("comp_low"),
+            "comp_median": override_median if override_market else current_state.get("comp_median"),
+            "comp_high": override_high if override_market else current_state.get("comp_high"),
+            "sample_size": current_state.get("sample_size", 1),
+            "source_quality": "manual_override" if override_market else current_state.get("source_quality"),
+            "market_regime": "manual_override" if override_market else current_state.get("market_regime"),
+            "market_as_of_timestamp": current_state.get("market_as_of_timestamp"),
+        }
         # --- THE LIVE LOG ---
         log_placeholder = st.empty()
         with log_placeholder.container():
@@ -314,7 +394,8 @@ else:
             forecasted_occupancy=float(forecasted_occ),
             shock=demand_shock,
             manual_event_text=manual_event,
-            competitor_price=float(current_state.get("competitor_price", 120.0)),
+            competitor_price=float(market_context.get("comp_median") or current_state.get("competitor_price", 120.0)),
+            market_context=market_context,
             booking_velocity=float(current_state.get("booking_velocity", 1.0)),
             historical_avg_otb=int(current_state.get("historical_avg_otb", 1)),
             market_state=current_state,
@@ -357,6 +438,8 @@ else:
             st.write(f"**Applied Logic Flags:** {agent_result['logic_flags']}")
             st.write(f"**Forecasted Occupancy:** {agent_result['forecasted_occupancy']*100}%")
             st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
+            st.write(f"**Market Context:** {agent_result.get('market_context', {})}")
+            st.write(f"**Sold-Out Compression:** {agent_result.get('optimizer_diagnostics', {}).get('sold_out', False)}")
             st.write(f"**AI Recommended Action:** {agent_result.get('ai_recommended_action', 'n/a')}")
             st.write(f"**AI Risk Level:** {agent_result.get('ai_risk_level', 'n/a')}")
             st.write(f"**AI Review Flags:** {agent_result.get('ai_review_flags', [])}")

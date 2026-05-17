@@ -95,7 +95,14 @@ class ExplainablePricingTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["Signal"] for row in result["decision_context_components"]],
-            ["Demand anchor", "Competitor signal", "AI advisory"],
+            [
+                "Current booked occupancy",
+                "Retained OTB after cancellations",
+                "Demand anchor",
+                "Competitor signal",
+                "Market premium headroom",
+                "AI advisory",
+            ],
         )
 
     def test_missing_ai_key_keeps_optimizer_price_with_clean_advisory(self):
@@ -309,6 +316,59 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertEqual(context_only["rule_based_price"], context_only["optimized_price"])
         self.assertGreater(applied["optimized_price"], context_only["optimized_price"])
         self.assertIn("Local intel was considered as context only", context_only["strategic_reasoning"])
+
+    def test_manager_summary_distinguishes_current_booked_from_forecast(self):
+        summary = pricing_agent._manager_summary(
+            {
+                "optimized_price": 138.41,
+                "raw_otb_occupancy": 1.0,
+                "adjusted_otb_occupancy": 0.6504,
+                "current_occupancy": 0.6504,
+                "forecasted_occupancy": 0.932,
+                "booking_velocity": 1.0,
+                "competitor_price": 138.41,
+            },
+            "Review Before Publishing",
+        )
+
+        self.assertIn("currently 100.0% booked", summary)
+        self.assertIn("retained OTB is 65.0%", summary)
+        self.assertIn("forecast is 93.2%", summary)
+        self.assertNotIn("already 93.2% booked", summary)
+
+    def test_sep_1_regression_uses_sold_out_floor_and_clear_summary(self):
+        self._original_resolve_api_key = pricing_agent._resolve_api_key
+        pricing_agent._resolve_api_key = lambda: "test-key"
+        pricing_agent.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=FakeCompletions({
+                    "ai_recommended_action": "Review Before Publishing",
+                    "ai_risk_level": "Medium",
+                    "perceived_demand_strength": "High",
+                    "ai_review_flags": [],
+                    "ai_owner_summary": "The recommended ADR is sound because the hotel is already 93.2% booked.",
+                })
+            )
+        )
+
+        result = pricing_agent.run_agentic_pricing(
+            target_date="2017-09-01",
+            current_occupancy=0.6504,
+            forecasted_occupancy=0.9320299768,
+            shock=0.0,
+            competitor_price=138.41,
+            booking_velocity=1.0,
+            raw_otb_occupancy=1.0,
+            adjusted_otb_occupancy=0.6504,
+            expected_cancellations=82.86,
+        )
+
+        self.assertGreaterEqual(result["final_adr"], 138.41)
+        self.assertTrue(result["optimizer_diagnostics"]["sold_out"])
+        self.assertTrue(result["optimizer_diagnostics"]["sold_out_floor_applied"])
+        self.assertIn("currently 100.0% booked", result["strategic_reasoning"])
+        self.assertIn("retained OTB is 65.0%", result["strategic_reasoning"])
+        self.assertIn("forecast is 93.2%", result["strategic_reasoning"])
 
 
 if __name__ == "__main__":

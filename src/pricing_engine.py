@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+
 from config import (
     FORECAST_OUTPUT_PATH,
     MIN_PRICE,
@@ -9,6 +10,9 @@ from config import (
     PRICE_STEP,
 )
 
+SOLD_OUT_THRESHOLD = 0.9999
+MATERIAL_OCCUPANCY_GAP = 0.05
+
 
 def _round_money(value):
     return round(float(value), 2)
@@ -17,13 +21,15 @@ def _round_money(value):
 def _add_component(components, label, before, after, explanation):
     before = float(before)
     after = float(after)
-    components.append({
-        "driver": label,
-        "price_before": _round_money(before),
-        "adjustment": _round_money(after - before),
-        "price_after": _round_money(after),
-        "explanation": explanation,
-    })
+    components.append(
+        {
+            "driver": label,
+            "price_before": _round_money(before),
+            "adjustment": _round_money(after - before),
+            "price_after": _round_money(after),
+            "explanation": explanation,
+        }
+    )
 
 
 def _finite_float(value):
@@ -36,19 +42,59 @@ def _finite_float(value):
     return None
 
 
+def normalize_market_context(market_context=None, competitor_price=None):
+    """Normalize richer comp-set inputs while preserving legacy single-rate callers."""
+    context = dict(market_context or {})
+    legacy_price = _finite_float(competitor_price)
+    median = _finite_float(context.get("comp_median"))
+    if median is None:
+        median = legacy_price
+
+    if median is None:
+        return {
+            "comp_low": None,
+            "comp_median": None,
+            "comp_high": None,
+            "sample_size": 0,
+            "source_quality": context.get("source_quality", "unavailable"),
+            "market_regime": context.get("market_regime", "unavailable"),
+            "as_of_timestamp": context.get("as_of_timestamp") or context.get("market_as_of_timestamp"),
+        }
+
+    low = median if _finite_float(context.get("comp_low")) is None else float(context["comp_low"])
+    high = median if _finite_float(context.get("comp_high")) is None else float(context["comp_high"])
+    low, median, high = sorted([float(low), float(median), float(high)])
+    return {
+        "comp_low": _round_money(low),
+        "comp_median": _round_money(median),
+        "comp_high": _round_money(high),
+        "sample_size": int(_finite_float(context.get("sample_size")) or (1 if legacy_price is not None else 0)),
+        "source_quality": context.get("source_quality", "legacy_single_rate" if legacy_price is not None else "unavailable"),
+        "market_regime": context.get("market_regime", "legacy_single_rate" if legacy_price is not None else "unavailable"),
+        "as_of_timestamp": context.get("as_of_timestamp") or context.get("market_as_of_timestamp"),
+    }
+
+
 def _candidate_prices():
     start = int(np.ceil(MIN_PRICE / PRICE_STEP) * PRICE_STEP)
     end = int(np.floor(MAX_PRICE / PRICE_STEP) * PRICE_STEP)
     return [float(price) for price in range(start, end + PRICE_STEP, PRICE_STEP)]
 
 
-def _dynamic_elasticity(occupancy, booking_velocity, local_intel_shock):
-    """Conservative elasticity proxy for a PoC optimizer.
+def _is_sold_out(raw_otb_occupancy):
+    return raw_otb_occupancy is not None and raw_otb_occupancy >= SOLD_OUT_THRESHOLD
 
-    Higher compression makes demand less price sensitive; weak pace makes it
-    more sensitive. This is intentionally transparent until a learned demand
-    model replaces it.
-    """
+
+def _has_material_retention_gap(raw_otb_occupancy, adjusted_otb_occupancy):
+    return (
+        raw_otb_occupancy is not None
+        and adjusted_otb_occupancy is not None
+        and (raw_otb_occupancy - adjusted_otb_occupancy) >= MATERIAL_OCCUPANCY_GAP
+    )
+
+
+def _dynamic_elasticity(occupancy, booking_velocity, local_intel_shock):
+    """Transparent elasticity proxy until a learned demand model replaces it."""
     elasticity = 1.35
     if occupancy >= 0.90:
         elasticity -= 0.35
@@ -70,30 +116,146 @@ def _dynamic_elasticity(occupancy, booking_velocity, local_intel_shock):
     return max(0.65, min(2.00, elasticity))
 
 
-def _estimate_expected_occupancy(candidate_price, demand_anchor, reference_price, elasticity, competitor_price):
+def _clamp01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def _lead_time_days(target_date, market_context):
+    if target_date is None:
+        return 14
+    try:
+        stay_date = pd.Timestamp(target_date).normalize()
+    except Exception:
+        return 14
+    as_of = market_context.get("as_of_timestamp")
+    if as_of:
+        try:
+            return max(0, int((stay_date - pd.Timestamp(as_of).normalize()).days))
+        except Exception:
+            pass
+    return 14
+
+
+def _compression_profile(
+    demand_anchor,
+    booking_velocity,
+    raw_otb_occupancy,
+    adjusted_otb_occupancy,
+    local_intel_shock,
+    lead_time_days,
+    market_regime,
+):
+    raw_occ = demand_anchor if raw_otb_occupancy is None else raw_otb_occupancy
+    adjusted_occ = demand_anchor if adjusted_otb_occupancy is None else adjusted_otb_occupancy
+    occupancy_score = _clamp01((demand_anchor - 0.55) / 0.40)
+    scarcity_score = _clamp01((raw_occ - 0.70) / 0.30)
+    pace_score = _clamp01((booking_velocity - 0.80) / 0.60)
+    lead_score = (
+        1.0
+        if lead_time_days <= 3
+        else 0.75
+        if lead_time_days <= 7
+        else 0.50
+        if lead_time_days <= 14
+        else 0.25
+        if lead_time_days <= 30
+        else 0.0
+    )
+    event_score = _clamp01(max(local_intel_shock, 0.0) / 0.15)
+    retention_ratio = adjusted_occ / raw_occ if raw_occ and raw_occ > 0 else 1.0
+    retention_confidence = _clamp01((retention_ratio - 0.55) / 0.35)
+    market_bonus = 0.08 if market_regime == "market_wide_sellout" else 0.04 if market_regime == "event_compression" else 0.0
+
+    score = (
+        (0.40 * occupancy_score)
+        + (0.20 * scarcity_score)
+        + (0.20 * pace_score)
+        + (0.10 * lead_score)
+        + (0.10 * event_score)
+    )
+    score = _clamp01((score * (0.75 + (0.25 * retention_confidence))) + market_bonus)
+
+    if score >= 0.80:
+        allowed_premium_pct = 0.18
+        regime = "last_room"
+    elif score >= 0.60:
+        allowed_premium_pct = 0.12
+        regime = "strong_compression"
+    elif score >= 0.35:
+        allowed_premium_pct = 0.06
+        regime = "healthy_demand"
+    else:
+        allowed_premium_pct = 0.02
+        regime = "soft_market"
+
+    if market_regime == "market_wide_sellout":
+        allowed_premium_pct = min(0.20, allowed_premium_pct + 0.02)
+    elif market_regime == "event_compression":
+        allowed_premium_pct = min(0.20, allowed_premium_pct + 0.01)
+
+    return {
+        "compression_score": round(score, 4),
+        "allowed_premium_pct": round(allowed_premium_pct, 4),
+        "market_position_regime": regime,
+        "retention_ratio": round(retention_ratio, 4),
+        "lead_time_days": int(lead_time_days),
+    }
+
+
+def _estimate_expected_occupancy(candidate_price, demand_anchor, reference_price, elasticity, market_context, allowed_premium_pct):
     price_ratio = (candidate_price - reference_price) / max(reference_price, 1.0)
     expected_occ = demand_anchor * np.exp(-elasticity * price_ratio)
 
-    if competitor_price is not None and competitor_price > 0:
-        competitor_gap = (candidate_price - competitor_price) / competitor_price
-        if competitor_gap > 0:
-            expected_occ *= max(0.50, 1 - 0.65 * competitor_gap)
+    comp_median = market_context.get("comp_median")
+    comp_high = market_context.get("comp_high")
+    if comp_median is not None and comp_median > 0:
+        headroom_price = comp_median * (1 + allowed_premium_pct)
+        if candidate_price <= comp_median:
+            below_median_gap = (comp_median - candidate_price) / comp_median
+            expected_occ *= min(1.08, 1 + (0.08 * below_median_gap))
+        elif candidate_price <= headroom_price:
+            denominator = max(headroom_price - comp_median, 1.0)
+            within_headroom = (candidate_price - comp_median) / denominator
+            expected_occ *= max(0.90, 1 - (0.10 * within_headroom))
+        elif comp_high is not None and candidate_price <= comp_high:
+            denominator = max(comp_high - headroom_price, 1.0)
+            beyond_headroom = (candidate_price - headroom_price) / denominator
+            expected_occ *= max(0.75, 0.90 - (0.15 * beyond_headroom))
         else:
-            expected_occ *= min(1.10, 1 + 0.12 * abs(competitor_gap))
+            high_reference = max(comp_high or headroom_price, 1.0)
+            above_high_gap = max(0.0, (candidate_price - high_reference) / high_reference)
+            expected_occ *= max(0.45, 0.75 - (0.70 * above_high_gap))
 
     return max(0.0, min(1.0, float(expected_occ)))
 
 
-def _manual_review_flags(final_price, reference_price, competitor_price, occupancy, booking_velocity, manual_event_text, local_intel_shock):
+def _manual_review_flags(
+    final_price,
+    reference_price,
+    market_context,
+    occupancy,
+    booking_velocity,
+    manual_event_text,
+    local_intel_shock,
+    *,
+    sold_out=False,
+    raw_otb_occupancy=None,
+    adjusted_otb_occupancy=None,
+):
     flags = []
+    competitor_price = market_context.get("comp_median")
+    comp_high = market_context.get("comp_high")
     if competitor_price is None:
         flags.append("Competitor price unavailable; optimizer used internal reference pricing only.")
     else:
         competitor_gap = ((final_price - competitor_price) / competitor_price) * 100
         if competitor_gap > 25:
-            flags.append(f"Recommended ADR is {competitor_gap:.1f}% above competitor; review market positioning before publishing.")
+            flags.append(f"Recommended ADR is {competitor_gap:.1f}% above competitor median; review market positioning before publishing.")
         elif competitor_gap < -20 and occupancy >= 0.80:
-            flags.append(f"Recommended ADR is {abs(competitor_gap):.1f}% below competitor despite strong demand; check for underpricing.")
+            flags.append(f"Recommended ADR is {abs(competitor_gap):.1f}% below competitor median despite strong demand; check for underpricing.")
+        if comp_high and final_price > comp_high:
+            high_gap = ((final_price - comp_high) / comp_high) * 100
+            flags.append(f"Recommended ADR is {high_gap:.1f}% above the high end of the comp set; confirm the premium before publishing.")
 
     reference_gap = ((final_price - reference_price) / max(reference_price, 1.0)) * 100
     if abs(reference_gap) > 20:
@@ -101,6 +263,12 @@ def _manual_review_flags(final_price, reference_price, competitor_price, occupan
 
     if occupancy >= 0.92 and booking_velocity >= 1.2:
         flags.append("High compression and fast pickup detected; monitor guest perception and remaining inventory.")
+
+    if sold_out and _has_material_retention_gap(raw_otb_occupancy, adjusted_otb_occupancy):
+        flags.append(
+            "Raw OTB is sold out while retained occupancy is materially lower after cancellation risk; "
+            "verify cancellation assumptions and remaining-room strategy before publishing."
+        )
 
     if manual_event_text and local_intel_shock:
         flags.append("Local intel was applied to priced demand; confirm the event impact is still appropriate before publishing.")
@@ -115,6 +283,7 @@ def calculate_recommended_price(
     day_name,
     target_date=None,
     competitor_price=None,
+    market_context=None,
     return_breakdown=False,
     pre_shock_occupancy=None,
     manual_shock=0.0,
@@ -125,19 +294,13 @@ def calculate_recommended_price(
     adjusted_otb_occupancy=None,
     expected_cancellations=0.0,
 ):
-    """
-    Core Pricing Logic Engine.
-
-    The candidate-price optimizer estimates expected demand for each allowed price and selects the ADR with
-    the highest expected room revenue. When two candidates tie on revenue, the current policy favors the
-    higher price; this is intentional, but may be flipped during distressed periods if the business prefers
-    occupancy protection over ADR.
-    """
+    """Select the allowed ADR with the highest expected room revenue."""
     base_price = BASE_PRICE
     occupancy = max(0.0, min(1.0, float(occupancy)))
     organic_occupancy = occupancy if pre_shock_occupancy is None else max(0.0, min(1.0, float(pre_shock_occupancy)))
     booking_velocity = max(0.1, float(booking_velocity or 1.0))
-    competitor_price = _finite_float(competitor_price)
+    market_context = normalize_market_context(market_context, competitor_price)
+    competitor_price = market_context.get("comp_median")
     raw_otb_occupancy = _finite_float(raw_otb_occupancy)
     adjusted_otb_occupancy = _finite_float(adjusted_otb_occupancy)
     if raw_otb_occupancy is not None:
@@ -145,6 +308,7 @@ def calculate_recommended_price(
     if adjusted_otb_occupancy is not None:
         adjusted_otb_occupancy = max(0.0, min(1.0, adjusted_otb_occupancy))
     expected_cancellations = max(0.0, float(expected_cancellations or 0.0))
+    sold_out = _is_sold_out(raw_otb_occupancy)
     recommended_price = float(base_price)
     applied_rules = []
     components = []
@@ -170,11 +334,28 @@ def calculate_recommended_price(
         demand_anchor *= 1 - min(0.12, (1.0 - booking_velocity) * 0.25)
     demand_anchor = max(0.0, min(1.0, demand_anchor))
 
+    elasticity = _dynamic_elasticity(demand_anchor, booking_velocity, local_intel_shock)
+    lead_time_days = _lead_time_days(target_date, market_context)
+    compression = _compression_profile(
+        demand_anchor,
+        booking_velocity,
+        raw_otb_occupancy,
+        adjusted_otb_occupancy,
+        local_intel_shock,
+        lead_time_days,
+        market_context.get("market_regime"),
+    )
     reference_price = float(base_price)
     if competitor_price is not None:
-        reference_price = max(MIN_PRICE, min(MAX_PRICE, (base_price * 0.60) + (competitor_price * 0.40)))
+        market_pull = 0.20 + (0.60 * compression["compression_score"])
+        compression_lift = competitor_price * compression["allowed_premium_pct"] * 0.50 * compression["compression_score"]
+        reference_price = (
+            (base_price * (1 - market_pull))
+            + (competitor_price * market_pull)
+            + compression_lift
+        )
+        reference_price = max(MIN_PRICE, min(MAX_PRICE, reference_price))
 
-    elasticity = _dynamic_elasticity(demand_anchor, booking_velocity, local_intel_shock)
     candidates = []
     for candidate in _candidate_prices():
         expected_occupancy = _estimate_expected_occupancy(
@@ -182,19 +363,20 @@ def calculate_recommended_price(
             demand_anchor,
             reference_price,
             elasticity,
-            competitor_price,
+            market_context,
+            compression["allowed_premium_pct"],
         )
         expected_rooms = expected_occupancy * BASE_CAPACITY
         expected_revenue = candidate * expected_rooms
-        candidates.append({
-            "price": _round_money(candidate),
-            "expected_occupancy": round(expected_occupancy, 4),
-            "expected_rooms": round(expected_rooms, 2),
-            "expected_revenue": _round_money(expected_revenue),
-        })
+        candidates.append(
+            {
+                "price": _round_money(candidate),
+                "expected_occupancy": round(expected_occupancy, 4),
+                "expected_rooms": round(expected_rooms, 2),
+                "expected_revenue": _round_money(expected_revenue),
+            }
+        )
 
-    # Revenue is the primary objective. On an exact tie, favor the higher ADR for now.
-    # This policy is explicit because the business may want to reverse it in distressed periods.
     selected = max(candidates, key=lambda row: (row["expected_revenue"], row["price"]))
     optimized_price = selected["price"]
     recommended_price = optimized_price
@@ -212,7 +394,7 @@ def calculate_recommended_price(
         "Reference price",
         base_price,
         reference_price,
-        "Reference price blends the internal base rate with competitor context when available.",
+        "Reference price blends the internal base rate with comp-set context and demand compression when available.",
     )
     _add_component(
         components,
@@ -226,10 +408,33 @@ def calculate_recommended_price(
         "Competitor signal",
         optimized_price,
         optimized_price,
-        "Competitor price was used as a soft demand signal, not a hard ceiling." if competitor_price is not None else "No finite competitor price was available.",
+        (
+            f"Comp-set median ${competitor_price:.2f} and high ${market_context['comp_high']:.2f} were used as soft demand signals; "
+            f"{compression['market_position_regime'].replace('_', ' ')} allows up to {compression['allowed_premium_pct'] * 100:.0f}% premium over median."
+            if competitor_price is not None
+            else "No finite competitor price was available."
+        ),
     )
 
-    # Safety Guardrails (From Config)
+    sold_out_floor_price = None
+    sold_out_floor_applied = False
+    if sold_out:
+        floor_before = recommended_price
+        sold_out_floor_price = competitor_price
+        if competitor_price is not None:
+            recommended_price = max(recommended_price, competitor_price)
+            sold_out_floor_applied = recommended_price > floor_before
+            if sold_out_floor_applied:
+                applied_rules.append("Sold-Out Competitor Median Floor")
+            floor_explanation = (
+                "Raw OTB reached capacity, so scarce-inventory pricing cannot fall below competitor median."
+                if sold_out_floor_applied
+                else "Raw OTB reached capacity; optimizer ADR already meets or exceeds competitor median."
+            )
+        else:
+            floor_explanation = "Raw OTB reached capacity, but no competitor price was available for a parity floor."
+        _add_component(components, "Sold-out floor", floor_before, recommended_price, floor_explanation)
+
     before_guardrail = recommended_price
     recommended_price = max(MIN_PRICE, min(MAX_PRICE, recommended_price))
     _add_component(
@@ -241,14 +446,27 @@ def calculate_recommended_price(
     )
 
     final_price = round(recommended_price, 2)
+    final_expected_occupancy = _estimate_expected_occupancy(
+        final_price,
+        demand_anchor,
+        reference_price,
+        elasticity,
+        market_context,
+        compression["allowed_premium_pct"],
+    )
+    final_expected_rooms = final_expected_occupancy * BASE_CAPACITY
+    final_expected_revenue = final_price * final_expected_rooms
     review_flags = _manual_review_flags(
         final_price,
         reference_price,
-        competitor_price,
+        market_context,
         demand_anchor,
         booking_velocity,
         manual_event_text,
         local_intel_shock,
+        sold_out=sold_out,
+        raw_otb_occupancy=raw_otb_occupancy,
+        adjusted_otb_occupancy=adjusted_otb_occupancy,
     )
     if not return_breakdown:
         return final_price, applied_rules + review_flags
@@ -262,6 +480,11 @@ def calculate_recommended_price(
         "raw_otb_occupancy": round(raw_otb_occupancy, 4) if raw_otb_occupancy is not None else None,
         "adjusted_otb_occupancy": round(adjusted_otb_occupancy, 4) if adjusted_otb_occupancy is not None else None,
         "expected_cancellations": _round_money(expected_cancellations),
+        "sold_out": sold_out,
+        "pricing_regime": "sold_out_protect_rate" if sold_out else "normal",
+        "sold_out_floor_price": _round_money(sold_out_floor_price) if sold_out_floor_price is not None else None,
+        "sold_out_floor_applied": sold_out_floor_applied,
+        "material_retention_gap": _has_material_retention_gap(raw_otb_occupancy, adjusted_otb_occupancy),
         "pricing_occupancy": round(organic_occupancy, 4),
         "demand_anchor": round(demand_anchor, 4),
         "manual_shock": round(manual_shock, 4),
@@ -270,50 +493,56 @@ def calculate_recommended_price(
         "elasticity": round(elasticity, 4),
         "day_name": day_name,
         "competitor_price": _round_money(competitor_price) if competitor_price is not None else None,
+        "market_context": market_context,
+        "compression_score": compression["compression_score"],
+        "allowed_premium_pct": compression["allowed_premium_pct"],
+        "market_position_regime": compression["market_position_regime"],
+        "retention_ratio": compression["retention_ratio"],
+        "lead_time_days": compression["lead_time_days"],
         "optimizer_candidates": candidates,
         "selected_candidate": selected,
-        "expected_rooms": selected["expected_rooms"],
-        "expected_revenue": selected["expected_revenue"],
+        "final_recommendation": {
+            "price": final_price,
+            "expected_occupancy": round(final_expected_occupancy, 4),
+            "expected_rooms": round(final_expected_rooms, 2),
+            "expected_revenue": _round_money(final_expected_revenue),
+        },
+        "expected_rooms": round(final_expected_rooms, 2),
+        "expected_revenue": _round_money(final_expected_revenue),
         "competitor_gap_pct": _round_money(((final_price - competitor_price) / competitor_price) * 100) if competitor_price else None,
+        "comp_median_gap_pct": _round_money(((final_price - competitor_price) / competitor_price) * 100) if competitor_price else None,
+        "comp_high_gap_pct": _round_money(((final_price - market_context["comp_high"]) / market_context["comp_high"]) * 100) if market_context.get("comp_high") else None,
         "review_flags": review_flags,
         "components": components,
         "applied_rules": applied_rules + review_flags,
     }
     return final_price, applied_rules + review_flags, breakdown
 
+
 def generate_pricing_report():
-    """
-    Reads the demand forecast and applies pricing logic to all 30 days.
-    """
+    """Read the demand forecast and apply pricing logic to all future dates."""
     try:
-        # Load the latest forecast
         df = pd.read_csv(FORECAST_OUTPUT_PATH)
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # Add helper columns for logic
-        df['Day_Name'] = df['Date'].dt.day_name()
-
-        # Apply the pricing function row by row
-        df['Recommended_Price'] = df.apply(
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["Day_Name"] = df["Date"].dt.day_name()
+        df["Recommended_Price"] = df.apply(
             lambda row: calculate_recommended_price(
-                row['Forecasted_Occupancy'], 
-                row['Day_Name'],
-                row['Date'],
-                competitor_price=row.get('Competitor_Rate', None)
-            )[0], axis=1
+                row["Forecasted_Occupancy"],
+                row["Day_Name"],
+                row["Date"],
+                competitor_price=row.get("Competitor_Rate", None),
+            )[0],
+            axis=1,
         )
-
-        # Calculate Revenue Forecast (Price * Predicted Rooms)
-        df['Forecasted_Revenue'] = df['Recommended_Price'] * (df['Forecasted_Occupancy'] * BASE_CAPACITY )
-
+        df["Forecasted_Revenue"] = df["Recommended_Price"] * (df["Forecasted_Occupancy"] * BASE_CAPACITY)
         print(f"Pricing Engine successfully processed {len(df)} days.")
         return df
-
     except FileNotFoundError:
         print("Error: Forecast file not found. Run demand_forecast.py first.")
         return None
 
+
 if __name__ == "__main__":
     report = generate_pricing_report()
     if report is not None:
-        print(report[['Date', 'Day_Name', 'Forecasted_Occupancy', 'Recommended_Price']].head())
+        print(report[["Date", "Day_Name", "Forecasted_Occupancy", "Recommended_Price"]].head())

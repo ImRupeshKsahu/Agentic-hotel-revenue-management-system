@@ -177,6 +177,42 @@ class CancellationAdjustedOTBTests(unittest.TestCase):
         self.assertEqual(adjusted_price, baseline_price)
         self.assertEqual(breakdown["pricing_occupancy"], 0.82)
 
+    def test_sold_out_raw_otb_applies_competitor_parity_floor(self):
+        price, _, breakdown = calculate_recommended_price(
+            occupancy=0.932,
+            day_name="Friday",
+            competitor_price=138.41,
+            booking_velocity=1.0,
+            raw_otb_occupancy=1.0,
+            adjusted_otb_occupancy=0.6504,
+            expected_cancellations=82.86,
+            return_breakdown=True,
+        )
+
+        self.assertGreaterEqual(price, 138.41)
+        self.assertTrue(breakdown["sold_out"])
+        self.assertEqual(breakdown["pricing_regime"], "sold_out_protect_rate")
+        self.assertTrue(breakdown["sold_out_floor_applied"])
+        self.assertTrue(breakdown["material_retention_gap"])
+        self.assertTrue(
+            any("retained occupancy is materially lower" in flag for flag in breakdown["review_flags"])
+        )
+
+    def test_sold_out_floor_does_not_reduce_stronger_optimizer_price(self):
+        price, _, breakdown = calculate_recommended_price(
+            occupancy=1.0,
+            day_name="Friday",
+            competitor_price=80.0,
+            booking_velocity=1.0,
+            raw_otb_occupancy=1.0,
+            adjusted_otb_occupancy=0.98,
+            expected_cancellations=2.0,
+            return_breakdown=True,
+        )
+
+        self.assertGreaterEqual(price, breakdown["selected_candidate"]["price"])
+        self.assertFalse(breakdown["sold_out_floor_applied"])
+
 
 if __name__ == "__main__":
     unittest.main()
