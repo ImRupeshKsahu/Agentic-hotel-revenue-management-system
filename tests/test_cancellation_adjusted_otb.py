@@ -112,6 +112,48 @@ class CancellationAdjustedOTBTests(unittest.TestCase):
         self.assertGreaterEqual(row["Adjusted_OTB"], 0)
         self.assertLessEqual(row["Adjusted_OTB"], row["Live_OTB"])
 
+    def test_gross_pace_uses_uncapped_otb_while_display_otb_stays_capped(self):
+        as_of = pd.Timestamp("2024-01-31")
+        current_stay = "2024-02-01"
+        historical_stay = "2023-02-01"
+        rows = []
+        for booking_id in range(1, 13):
+            rows.append(booking(booking_id, current_stay, "2024-01-20"))
+        for booking_id in range(13, 23):
+            rows.append(booking(booking_id, historical_stay, "2023-01-20"))
+
+        snapshot = calculate_otb_snapshot(pd.DataFrame(rows), as_of_date=as_of, horizon_days=1, capacity=10)
+        row = snapshot.iloc[0]
+
+        self.assertEqual(row["Live_OTB"], 10)
+        self.assertEqual(row["Gross_OTB"], 12)
+        self.assertEqual(row["Historical_Avg_OTB"], 10)
+        self.assertEqual(row["Gross_Pace_Index"], 1.10)
+        self.assertEqual(row["Booking_Velocity"], row["Gross_Pace_Index"])
+
+    def test_snapshot_emits_richer_pace_family(self):
+        as_of = pd.Timestamp("2024-01-31")
+        bookings = pd.DataFrame(
+            [
+                booking(1, "2024-02-01", "2024-01-20"),
+                booking(2, "2024-02-01", "2024-01-28"),
+                booking(3, "2023-02-01", "2023-01-20"),
+            ]
+        )
+
+        snapshot = calculate_otb_snapshot(bookings, as_of_date=as_of, horizon_days=1, capacity=10)
+        row = snapshot.iloc[0]
+
+        for column in [
+            "Gross_Pace_Index",
+            "Retained_Pace_Index",
+            "Pickup_Trend_Index",
+            "Pricing_Pace_Index",
+            "Pace_Confidence",
+        ]:
+            self.assertIn(column, snapshot.columns)
+        self.assertEqual(row["Pace_Confidence"], "high")
+
     def test_fragile_otb_no_longer_overstates_pricing_occupancy(self):
         result = optimizer_node(
             {

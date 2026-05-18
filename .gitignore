@@ -24,12 +24,15 @@ env/
 
 # Streamlit
 .streamlit/secrets.toml
+streamlit.stdout.log
+streamlit.stderr.log
 
 # Local OS/editor files
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+~$*.xlsx
 
 # Generated model/output artifacts
 src/models/*.pkl

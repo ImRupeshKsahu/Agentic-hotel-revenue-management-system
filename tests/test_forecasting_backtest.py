@@ -16,7 +16,10 @@ from forecasting import (
     _feature_vector,
     _generate_weekly_folds,
     _interval_bounds_for_lag,
+    _unavailable_model_reason,
+    run_backtest_detailed,
 )
+import forecasting
 
 
 def make_daily_frame(start="2015-07-01", periods=793):
@@ -112,6 +115,36 @@ class ForecastingBacktestTests(unittest.TestCase):
         self.assertNotEqual(lag1_bounds, lag2_bounds)
         self.assertTrue(0 <= lag1_bounds[0] <= lag1_bounds[1] <= 1)
         self.assertTrue(0 <= lag2_bounds[0] <= lag2_bounds[1] <= 1)
+
+    def test_sarimax_unavailability_is_explicit_when_dependency_is_missing(self):
+        original_sarimax = forecasting.SARIMAX
+        try:
+            forecasting.SARIMAX = None
+            self.assertEqual(
+                _unavailable_model_reason("sarimax"),
+                "statsmodels SARIMAX is unavailable",
+            )
+        finally:
+            forecasting.SARIMAX = original_sarimax
+
+    def test_backtest_skips_unavailable_sarimax_instead_of_relabeling_fallback(self):
+        original_sarimax = forecasting.SARIMAX
+        try:
+            forecasting.SARIMAX = None
+            daily = make_daily_frame(periods=430)
+            overall, _, _, predictions, _, _ = run_backtest_detailed(
+                daily,
+                models=["seasonal_naive_7", "sarimax"],
+                horizon=7,
+                min_train_days=365,
+                step_days=7,
+                audit_folds=1,
+            )
+
+            self.assertEqual(set(predictions["Model"]), {"seasonal_naive_7"})
+            self.assertEqual(set(overall["Model"]), {"seasonal_naive_7"})
+        finally:
+            forecasting.SARIMAX = original_sarimax
 
 
 if __name__ == "__main__":

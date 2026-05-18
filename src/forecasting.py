@@ -115,6 +115,24 @@ SARIMAX_CANDIDATES = [
 ]
 
 
+def _unavailable_model_reason(model_name: str) -> Optional[str]:
+    """Return a human-readable reason when a requested model cannot run natively."""
+    if model_name == "ets" and ExponentialSmoothing is None:
+        return "statsmodels ExponentialSmoothing is unavailable"
+    if model_name == "sarimax" and SARIMAX is None:
+        return "statsmodels SARIMAX is unavailable"
+    if model_name.startswith(("random_forest", "extra_trees", "ridge", "elasticnet")) and _base_estimator(model_name) is None:
+        return "scikit-learn estimator is unavailable"
+    if model_name.startswith("xgboost") and _base_estimator(model_name) is None:
+        return "xgboost estimator is unavailable"
+    return None
+
+
+def available_models(models: Iterable[str]) -> list[str]:
+    """Filter a model list down to those that can run without substituting another model."""
+    return [model_name for model_name in models if _unavailable_model_reason(model_name) is None]
+
+
 @dataclass(frozen=True)
 class ForecastChampion:
     model: str
@@ -632,7 +650,15 @@ def run_backtest_detailed(
     audit_folds: int = DEFAULT_AUDIT_FOLDS,
 ):
     df = _actuals(daily_df)
-    models = list(models or DEFAULT_MODELS)
+    requested_models = list(models or DEFAULT_MODELS)
+    unavailable_models = {
+        model_name: reason
+        for model_name in requested_models
+        if (reason := _unavailable_model_reason(model_name)) is not None
+    }
+    models = [model_name for model_name in requested_models if model_name not in unavailable_models]
+    for model_name, reason in unavailable_models.items():
+        print(f"Skipping {model_name}: {reason}", flush=True)
     folds = (
         _scenario_folds(df, list(scenario_lags), horizon)
         if scenario_lags is not None
@@ -721,6 +747,18 @@ def save_champion(champion: ForecastChampion, path: str):
             indent=4,
             default=str,
         )
+
+
+def _safe_to_csv(df: pd.DataFrame, path: str, index: bool = False) -> str:
+    try:
+        df.to_csv(path, index=index)
+        return path
+    except PermissionError:
+        root, ext = os.path.splitext(path)
+        fallback = f"{root}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        df.to_csv(fallback, index=index)
+        print(f"Could not overwrite locked file {path}. Saved copy to {fallback}", flush=True)
+        return fallback
 
 
 def load_champion(path: str, default_horizon: int = DEFAULT_HORIZON) -> ForecastChampion:
@@ -1037,18 +1075,18 @@ def run_backtest_and_save(
     )
 
     os.makedirs(os.path.dirname(paths["forecast"]), exist_ok=True)
-    forecast.to_csv(paths["forecast"], index=False)
-    overall.to_csv(paths["comparison"], index=False)
-    overall.head(1).to_csv(paths["metrics"], index=False)
-    lag_metrics.to_csv(paths["lag_metrics"], index=False)
-    scenario_metrics.to_csv(paths["scenario_metrics"], index=False)
-    predictions.to_csv(paths["predictions"], index=False)
-    fold_metrics.to_csv(paths["fold_metrics"], index=False)
-    audit_predictions.to_csv(paths["audit_predictions"], index=False)
-    audit_fold_metrics.to_csv(paths["audit_fold_metrics"], index=False)
-    audit_summary.to_csv(paths["audit_summary"], index=False)
-    audit_lag_metrics.to_csv(paths["audit_lag_metrics"], index=False)
-    audit_interval_coverage.to_csv(paths["audit_interval_coverage"], index=False)
+    _safe_to_csv(forecast, paths["forecast"], index=False)
+    _safe_to_csv(overall, paths["comparison"], index=False)
+    _safe_to_csv(overall.head(1), paths["metrics"], index=False)
+    _safe_to_csv(lag_metrics, paths["lag_metrics"], index=False)
+    _safe_to_csv(scenario_metrics, paths["scenario_metrics"], index=False)
+    _safe_to_csv(predictions, paths["predictions"], index=False)
+    _safe_to_csv(fold_metrics, paths["fold_metrics"], index=False)
+    _safe_to_csv(audit_predictions, paths["audit_predictions"], index=False)
+    _safe_to_csv(audit_fold_metrics, paths["audit_fold_metrics"], index=False)
+    _safe_to_csv(audit_summary, paths["audit_summary"], index=False)
+    _safe_to_csv(audit_lag_metrics, paths["audit_lag_metrics"], index=False)
+    _safe_to_csv(audit_interval_coverage, paths["audit_interval_coverage"], index=False)
     save_champion(champion, paths["champion"])
     save_forecast_plots(daily_df, forecast, champion.model, lag_metrics, predictions, paths["plots_dir"])
     _plot_backtest_timeline(folds, paths["timeline_plot"])
@@ -1078,7 +1116,7 @@ def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DE
         )
         save_champion(champion, paths["champion"])
     os.makedirs(os.path.dirname(paths["forecast"]), exist_ok=True)
-    forecast.to_csv(paths["forecast"], index=False)
+    _safe_to_csv(forecast, paths["forecast"], index=False)
     _plot_best_model_forecast(_actuals(daily_df), forecast, champion.model, os.path.join(paths["plots_dir"], "champion_actuals_forecast.png"))
     return forecast, champion
 

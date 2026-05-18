@@ -8,6 +8,9 @@ from cancellation_risk import estimate_cancellation_probabilities
 from config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, RAW_BOOKINGS_PATH
 from data_pipeline import normalize_bookings
 
+PACE_SMOOTHING_ROOMS = 10.0
+PICKUP_WINDOW_DAYS = 7
+
 
 def _active_on_books(
     bookings_df: pd.DataFrame,
@@ -53,6 +56,39 @@ def _active_on_books(
     return pd.DataFrame(exploded)
 
 
+def _aggregate_active(active: pd.DataFrame, stay_dates: pd.Series) -> pd.DataFrame:
+    if active.empty:
+        agg = pd.DataFrame({"Date": stay_dates})
+        agg["Gross_OTB"] = 0
+        agg["Adjusted_OTB"] = 0.0
+        agg["Expected_Cancellations"] = 0.0
+        agg["OTB_ADR"] = np.nan
+        return agg
+
+    agg = (
+        active.groupby("stay_date")
+        .agg(
+            Gross_OTB=("booking_id", "count"),
+            Adjusted_OTB=("expected_retained_rooms", "sum"),
+            Expected_Cancellations=("expected_cancellations", "sum"),
+            OTB_ADR=("adr", "mean"),
+        )
+        .reset_index()
+        .rename(columns={"stay_date": "Date"})
+    )
+    return pd.DataFrame({"Date": stay_dates}).merge(agg, on="Date", how="left")
+
+
+def _pace_ratio(current, historical):
+    return (current + PACE_SMOOTHING_ROOMS) / (historical + PACE_SMOOTHING_ROOMS)
+
+
+def _pickup_trend_index(current_pickup, historical_pickup):
+    denominator = np.maximum(np.abs(historical_pickup), PACE_SMOOTHING_ROOMS)
+    relative_change = (current_pickup - historical_pickup) / denominator
+    return 1 + np.clip(relative_change, -0.50, 0.50)
+
+
 def calculate_otb_snapshot(
     bookings_df: pd.DataFrame,
     as_of_date=DATA_END_DATE,
@@ -63,34 +99,29 @@ def calculate_otb_snapshot(
     as_of_date = pd.to_datetime(as_of_date)
     stay_dates = pd.Series(pd.date_range(as_of_date + pd.Timedelta(days=1), periods=horizon_days, freq="D"))
     active = _active_on_books(bookings_df, as_of_date, stay_dates, include_cancellation_risk=True)
+    previous_active = _active_on_books(
+        bookings_df,
+        as_of_date - pd.Timedelta(days=PICKUP_WINDOW_DAYS),
+        stay_dates,
+        include_cancellation_risk=True,
+    )
 
-    if active.empty:
-        otb = pd.DataFrame(
-            {
-                "Date": stay_dates,
-                "Live_OTB": 0,
-                "Adjusted_OTB": 0.0,
-                "Expected_Cancellations": 0.0,
-                "OTB_ADR": np.nan,
-            }
-        )
-    else:
-        otb = (
-            active.groupby("stay_date")
-            .agg(
-                Live_OTB=("booking_id", "count"),
-                Adjusted_OTB=("expected_retained_rooms", "sum"),
-                Expected_Cancellations=("expected_cancellations", "sum"),
-                OTB_ADR=("adr", "mean"),
-            )
-            .reset_index()
-            .rename(columns={"stay_date": "Date"})
-        )
-        otb = pd.DataFrame({"Date": stay_dates}).merge(otb, on="Date", how="left")
+    otb = _aggregate_active(active, stay_dates)
+    previous = _aggregate_active(previous_active, stay_dates)[["Date", "Gross_OTB", "Adjusted_OTB"]].rename(
+        columns={
+            "Gross_OTB": "Previous_Gross_OTB",
+            "Adjusted_OTB": "Previous_Adjusted_OTB",
+        }
+    )
+    otb = otb.merge(previous, on="Date", how="left")
 
-    otb["Live_OTB"] = otb["Live_OTB"].fillna(0).astype(int).clip(upper=capacity)
+    otb["Gross_OTB"] = otb["Gross_OTB"].fillna(0).astype(int)
+    otb["Live_OTB"] = otb["Gross_OTB"].clip(upper=capacity)
     otb["Adjusted_OTB"] = otb["Adjusted_OTB"].fillna(0).clip(lower=0, upper=otb["Live_OTB"]).round(2)
     otb["Expected_Cancellations"] = (otb["Live_OTB"] - otb["Adjusted_OTB"]).clip(lower=0).round(2)
+    otb["Previous_Gross_OTB"] = otb["Previous_Gross_OTB"].fillna(0).astype(int)
+    otb["Previous_Adjusted_OTB"] = otb["Previous_Adjusted_OTB"].fillna(0).clip(lower=0).round(2)
+    otb["Net_Pickup_7d"] = otb["Gross_OTB"] - otb["Previous_Gross_OTB"]
     otb["OTB_Occupancy"] = otb["Live_OTB"] / capacity
     otb["Adjusted_OTB_Occupancy"] = (otb["Adjusted_OTB"] / capacity).round(4)
     otb["OTB_ADR"] = otb["OTB_ADR"].round(2)
@@ -98,17 +129,85 @@ def calculate_otb_snapshot(
     otb["As_Of_Date"] = as_of_date
 
     historical_as_of = as_of_date - pd.DateOffset(years=1)
-    historical = _active_on_books(bookings_df, historical_as_of, stay_dates - pd.DateOffset(years=1))
+    historical_stay_dates = stay_dates - pd.DateOffset(years=1)
+    historical = _active_on_books(
+        bookings_df,
+        historical_as_of,
+        historical_stay_dates,
+        include_cancellation_risk=True,
+    )
+    historical_previous = _active_on_books(
+        bookings_df,
+        historical_as_of - pd.Timedelta(days=PICKUP_WINDOW_DAYS),
+        historical_stay_dates,
+        include_cancellation_risk=True,
+    )
     if historical.empty:
-        otb["Historical_Avg_OTB"] = otb["Live_OTB"].clip(lower=1)
+        otb["Historical_Gross_OTB"] = np.nan
+        otb["Historical_Adjusted_OTB"] = np.nan
     else:
-        historical_counts = historical.groupby("stay_date").size().reset_index(name="Historical_Avg_OTB")
-        historical_counts["Date"] = historical_counts["stay_date"] + pd.DateOffset(years=1)
-        otb = otb.merge(historical_counts[["Date", "Historical_Avg_OTB"]], on="Date", how="left")
-        otb["Historical_Avg_OTB"] = otb["Historical_Avg_OTB"].fillna(otb["Live_OTB"].rolling(7, min_periods=1).mean())
+        historical_current = _aggregate_active(historical, historical_stay_dates)[
+            ["Date", "Gross_OTB", "Adjusted_OTB"]
+        ].rename(
+            columns={
+                "Gross_OTB": "Historical_Gross_OTB",
+                "Adjusted_OTB": "Historical_Adjusted_OTB",
+            }
+        )
+        historical_current["Date"] = historical_current["Date"] + pd.DateOffset(years=1)
+        otb = otb.merge(historical_current, on="Date", how="left")
 
-    otb["Historical_Avg_OTB"] = otb["Historical_Avg_OTB"].fillna(1).clip(lower=1).round().astype(int)
-    otb["Booking_Velocity"] = (otb["Live_OTB"] / otb["Historical_Avg_OTB"]).replace([np.inf, -np.inf], 0).round(2)
+    if historical_previous.empty:
+        historical_prev = pd.DataFrame(
+            {
+                "Date": stay_dates,
+                "Historical_Previous_Gross_OTB": np.nan,
+            }
+        )
+    else:
+        historical_prev = _aggregate_active(historical_previous, historical_stay_dates)[["Date", "Gross_OTB"]].rename(
+            columns={"Gross_OTB": "Historical_Previous_Gross_OTB"}
+        )
+        historical_prev["Date"] = historical_prev["Date"] + pd.DateOffset(years=1)
+    otb = otb.merge(historical_prev, on="Date", how="left")
+
+    historical_columns = [
+        "Historical_Gross_OTB",
+        "Historical_Adjusted_OTB",
+        "Historical_Previous_Gross_OTB",
+    ]
+    otb["Pace_Confidence"] = np.where(
+        otb[historical_columns].notna().all(axis=1),
+        "high",
+        "low",
+    )
+
+    otb["Historical_Gross_OTB"] = otb["Historical_Gross_OTB"].fillna(otb["Gross_OTB"]).clip(lower=0)
+    otb["Historical_Adjusted_OTB"] = (
+        otb["Historical_Adjusted_OTB"].fillna(otb["Adjusted_OTB"]).clip(lower=0).round(2)
+    )
+    otb["Historical_Previous_Gross_OTB"] = (
+        otb["Historical_Previous_Gross_OTB"].fillna(otb["Previous_Gross_OTB"]).clip(lower=0)
+    )
+    otb["Historical_Net_Pickup_7d"] = otb["Historical_Gross_OTB"] - otb["Historical_Previous_Gross_OTB"]
+
+    otb["Gross_Pace_Index"] = _pace_ratio(otb["Gross_OTB"], otb["Historical_Gross_OTB"]).round(2)
+    otb["Retained_Pace_Index"] = _pace_ratio(
+        otb["Adjusted_OTB"],
+        otb["Historical_Adjusted_OTB"],
+    ).round(2)
+    otb["Pickup_Trend_Index"] = _pickup_trend_index(
+        otb["Net_Pickup_7d"],
+        otb["Historical_Net_Pickup_7d"],
+    ).round(2)
+    otb["Pricing_Pace_Index"] = (
+        (0.20 * otb["Gross_Pace_Index"])
+        + (0.50 * otb["Retained_Pace_Index"])
+        + (0.30 * otb["Pickup_Trend_Index"])
+    ).clip(lower=0.75, upper=1.25).round(2)
+
+    otb["Historical_Avg_OTB"] = otb["Historical_Gross_OTB"].clip(lower=1).round().astype(int)
+    otb["Booking_Velocity"] = otb["Gross_Pace_Index"]
     return otb
 
 
@@ -180,9 +279,13 @@ def export_live_market_state(
     state = {}
     for row in df.itertuples(index=False):
         status = "Normal"
-        if row.Booking_Velocity >= 1.2:
+        gross_pace_index = float(getattr(row, "Gross_Pace_Index", row.Booking_Velocity))
+        retained_pace_index = float(getattr(row, "Retained_Pace_Index", gross_pace_index))
+        pickup_trend_index = float(getattr(row, "Pickup_Trend_Index", gross_pace_index))
+        pricing_pace_index = float(getattr(row, "Pricing_Pace_Index", gross_pace_index))
+        if gross_pace_index >= 1.2:
             status = "Ahead of historical pace"
-        elif row.Booking_Velocity <= 0.8:
+        elif gross_pace_index <= 0.8:
             status = "Behind historical pace"
         state[pd.to_datetime(row.Date).strftime("%Y-%m-%d")] = {
             "current_otb": int(row.Live_OTB),
@@ -200,7 +303,15 @@ def export_live_market_state(
             "market_regime": str(row.market_regime),
             "market_as_of_timestamp": str(row.as_of_timestamp),
             "total_rooms": int(row.Capacity),
-            "booking_velocity": float(row.Booking_Velocity),
+            "gross_otb": int(getattr(row, "Gross_OTB", row.Live_OTB)),
+            "net_pickup_7d": int(getattr(row, "Net_Pickup_7d", 0)),
+            "historical_net_pickup_7d": int(getattr(row, "Historical_Net_Pickup_7d", 0)),
+            "gross_pace_index": gross_pace_index,
+            "retained_pace_index": retained_pace_index,
+            "pickup_trend_index": pickup_trend_index,
+            "pricing_pace_index": pricing_pace_index,
+            "pace_confidence": str(getattr(row, "Pace_Confidence", "low")),
+            "booking_velocity": gross_pace_index,
             "status": status,
         }
 

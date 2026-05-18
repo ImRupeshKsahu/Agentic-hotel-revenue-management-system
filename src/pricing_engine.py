@@ -2,12 +2,17 @@ import pandas as pd
 import numpy as np
 
 from config import (
+    DATA_PATH,
     FORECAST_OUTPUT_PATH,
     MIN_PRICE,
     MAX_PRICE,
     BASE_PRICE,
     BASE_CAPACITY,
     PRICE_STEP,
+    BASE_RATE_LOOKBACK_DAYS,
+    DYNAMIC_BASE_DOW_WEIGHT,
+    DYNAMIC_FLOOR_COMP_LOW_FACTOR,
+    DYNAMIC_CEILING_BASE_MULTIPLIER,
 )
 
 SOLD_OUT_THRESHOLD = 0.9999
@@ -75,9 +80,11 @@ def normalize_market_context(market_context=None, competitor_price=None):
     }
 
 
-def _candidate_prices():
-    start = int(np.ceil(MIN_PRICE / PRICE_STEP) * PRICE_STEP)
-    end = int(np.floor(MAX_PRICE / PRICE_STEP) * PRICE_STEP)
+def _candidate_prices(min_price=MIN_PRICE, max_price=MAX_PRICE):
+    start = int(np.ceil(min_price / PRICE_STEP) * PRICE_STEP)
+    end = int(np.floor(max_price / PRICE_STEP) * PRICE_STEP)
+    if end < start:
+        start = end = int(round(float(min_price) / PRICE_STEP) * PRICE_STEP)
     return [float(price) for price in range(start, end + PRICE_STEP, PRICE_STEP)]
 
 
@@ -93,7 +100,34 @@ def _has_material_retention_gap(raw_otb_occupancy, adjusted_otb_occupancy):
     )
 
 
-def _dynamic_elasticity(occupancy, booking_velocity, local_intel_shock):
+def _resolve_pace_signals(
+    booking_velocity=1.0,
+    gross_pace_index=None,
+    retained_pace_index=None,
+    pickup_trend_index=None,
+    pricing_pace_index=None,
+):
+    legacy_velocity = max(0.1, float(booking_velocity or 1.0))
+    gross = max(0.1, float(gross_pace_index if gross_pace_index is not None else legacy_velocity))
+    retained = max(0.1, float(retained_pace_index if retained_pace_index is not None else gross))
+    pickup = max(0.1, float(pickup_trend_index if pickup_trend_index is not None else gross))
+    pricing = (
+        max(0.1, float(pricing_pace_index))
+        if pricing_pace_index is not None
+        else legacy_velocity
+        if all(value is None for value in [gross_pace_index, retained_pace_index, pickup_trend_index])
+        else max(0.1, min(2.0, (0.20 * gross) + (0.50 * retained) + (0.30 * pickup)))
+    )
+    return {
+        "booking_velocity": gross,
+        "gross_pace_index": gross,
+        "retained_pace_index": retained,
+        "pickup_trend_index": pickup,
+        "pricing_pace_index": pricing,
+    }
+
+
+def _dynamic_elasticity(occupancy, pricing_pace_index, local_intel_shock):
     """Transparent elasticity proxy until a learned demand model replaces it."""
     elasticity = 1.35
     if occupancy >= 0.90:
@@ -103,9 +137,9 @@ def _dynamic_elasticity(occupancy, booking_velocity, local_intel_shock):
     elif occupancy < 0.55:
         elasticity += 0.30
 
-    if booking_velocity >= 1.25:
+    if pricing_pace_index >= 1.25:
         elasticity -= 0.20
-    elif booking_velocity <= 0.80:
+    elif pricing_pace_index <= 0.80:
         elasticity += 0.25
 
     if local_intel_shock > 0:
@@ -136,9 +170,118 @@ def _lead_time_days(target_date, market_context):
     return 14
 
 
+def _historical_pricing_window(target_date, market_context):
+    """Return a recent no-leakage ADR slice used to shape pricing policy."""
+    try:
+        historical = pd.read_csv(DATA_PATH, usecols=["Date", "ADR"], parse_dates=["Date"])
+    except (FileNotFoundError, ValueError):
+        return None, None
+
+    historical = historical[historical["ADR"].notna() & historical["ADR"].gt(0)].copy()
+    if historical.empty:
+        return None, None
+
+    latest_actual_date = historical["Date"].max().normalize()
+    as_of = market_context.get("as_of_timestamp")
+    if as_of:
+        try:
+            as_of_date = pd.Timestamp(as_of).normalize()
+        except Exception:
+            as_of_date = latest_actual_date
+    elif target_date is not None:
+        try:
+            as_of_date = min(pd.Timestamp(target_date).normalize() - pd.Timedelta(days=1), latest_actual_date)
+        except Exception:
+            as_of_date = latest_actual_date
+    else:
+        as_of_date = latest_actual_date
+
+    as_of_date = min(as_of_date, latest_actual_date)
+    start_date = as_of_date - pd.Timedelta(days=BASE_RATE_LOOKBACK_DAYS - 1)
+    recent = historical[historical["Date"].between(start_date, as_of_date)].copy()
+    if recent.empty:
+        recent = historical.copy()
+    return recent, as_of_date
+
+
+def _dynamic_price_policy(target_date, market_context, allowed_premium_pct):
+    """Build an explainable recent-history anchor plus adaptive guardrails."""
+    recent, as_of_date = _historical_pricing_window(target_date, market_context)
+    comp_low = _finite_float(market_context.get("comp_low"))
+    comp_median = _finite_float(market_context.get("comp_median"))
+    comp_high = _finite_float(market_context.get("comp_high"))
+    has_observed_comp_set = (
+        str(market_context.get("source_quality", "")).lower() != "legacy_single_rate"
+        and int(_finite_float(market_context.get("sample_size")) or 0) >= 2
+    )
+
+    if recent is None or recent.empty:
+        return {
+            "base_price": float(BASE_PRICE),
+            "min_price": float(MIN_PRICE),
+            "max_price": float(MAX_PRICE),
+            "as_of_date": None,
+            "lookback_days": 0,
+            "recent_median_adr": None,
+            "recent_p10_adr": None,
+            "recent_p95_adr": None,
+            "same_weekday_median_adr": None,
+            "has_observed_comp_set": has_observed_comp_set,
+            "used_fallback": True,
+        }
+
+    recent = recent.copy()
+    recent["dow"] = recent["Date"].dt.dayofweek
+    recent_median = float(recent["ADR"].median())
+    recent_p10 = float(recent["ADR"].quantile(0.10))
+    recent_p95 = float(recent["ADR"].quantile(0.95))
+    same_weekday_median = recent_median
+    if target_date is not None:
+        try:
+            target_dow = pd.Timestamp(target_date).dayofweek
+            weekday_slice = recent.loc[recent["dow"].eq(target_dow), "ADR"]
+            if not weekday_slice.empty:
+                same_weekday_median = float(weekday_slice.median())
+        except Exception:
+            pass
+
+    dynamic_base = (
+        (DYNAMIC_BASE_DOW_WEIGHT * same_weekday_median)
+        + ((1 - DYNAMIC_BASE_DOW_WEIGHT) * recent_median)
+    )
+
+    floor_inputs = [float(MIN_PRICE), recent_p10]
+    if has_observed_comp_set and comp_low is not None:
+        floor_inputs.append(comp_low * DYNAMIC_FLOOR_COMP_LOW_FACTOR)
+    dynamic_min = max(floor_inputs)
+
+    ceiling_inputs = [recent_p95, dynamic_base * DYNAMIC_CEILING_BASE_MULTIPLIER]
+    if has_observed_comp_set and comp_high is not None:
+        ceiling_inputs.append(comp_high * (1 + allowed_premium_pct))
+    elif comp_median is not None:
+        ceiling_inputs.append(comp_median)
+    dynamic_max = min(float(MAX_PRICE), max(ceiling_inputs))
+    dynamic_max = max(dynamic_max, dynamic_min)
+
+    return {
+        "base_price": _round_money(dynamic_base),
+        "min_price": _round_money(dynamic_min),
+        "max_price": _round_money(dynamic_max),
+        "as_of_date": as_of_date.strftime("%Y-%m-%d") if as_of_date is not None else None,
+        "lookback_days": int(len(recent)),
+        "recent_median_adr": _round_money(recent_median),
+        "recent_p10_adr": _round_money(recent_p10),
+        "recent_p95_adr": _round_money(recent_p95),
+        "same_weekday_median_adr": _round_money(same_weekday_median),
+        "has_observed_comp_set": has_observed_comp_set,
+        "used_fallback": False,
+    }
+
+
 def _compression_profile(
     demand_anchor,
-    booking_velocity,
+    gross_pace_index,
+    pickup_trend_index,
     raw_otb_occupancy,
     adjusted_otb_occupancy,
     local_intel_shock,
@@ -149,7 +292,8 @@ def _compression_profile(
     adjusted_occ = demand_anchor if adjusted_otb_occupancy is None else adjusted_otb_occupancy
     occupancy_score = _clamp01((demand_anchor - 0.55) / 0.40)
     scarcity_score = _clamp01((raw_occ - 0.70) / 0.30)
-    pace_score = _clamp01((booking_velocity - 0.80) / 0.60)
+    gross_pace_score = _clamp01((gross_pace_index - 0.80) / 0.60)
+    pickup_score = _clamp01((pickup_trend_index - 0.80) / 0.60)
     lead_score = (
         1.0
         if lead_time_days <= 3
@@ -169,7 +313,8 @@ def _compression_profile(
     score = (
         (0.40 * occupancy_score)
         + (0.20 * scarcity_score)
-        + (0.20 * pace_score)
+        + (0.12 * gross_pace_score)
+        + (0.08 * pickup_score)
         + (0.10 * lead_score)
         + (0.10 * event_score)
     )
@@ -234,7 +379,7 @@ def _manual_review_flags(
     reference_price,
     market_context,
     occupancy,
-    booking_velocity,
+    pickup_trend_index,
     manual_event_text,
     local_intel_shock,
     *,
@@ -261,7 +406,7 @@ def _manual_review_flags(
     if abs(reference_gap) > 20:
         flags.append(f"Recommended ADR moved {reference_gap:+.1f}% from the reference price.")
 
-    if occupancy >= 0.92 and booking_velocity >= 1.2:
+    if occupancy >= 0.92 and pickup_trend_index >= 1.2:
         flags.append("High compression and fast pickup detected; monitor guest perception and remaining inventory.")
 
     if sold_out and _has_material_retention_gap(raw_otb_occupancy, adjusted_otb_occupancy):
@@ -289,16 +434,30 @@ def calculate_recommended_price(
     manual_shock=0.0,
     local_intel_shock=0.0,
     booking_velocity=1.0,
+    gross_pace_index=None,
+    retained_pace_index=None,
+    pickup_trend_index=None,
+    pricing_pace_index=None,
     manual_event_text="",
     raw_otb_occupancy=None,
     adjusted_otb_occupancy=None,
     expected_cancellations=0.0,
 ):
     """Select the allowed ADR with the highest expected room revenue."""
-    base_price = BASE_PRICE
     occupancy = max(0.0, min(1.0, float(occupancy)))
     organic_occupancy = occupancy if pre_shock_occupancy is None else max(0.0, min(1.0, float(pre_shock_occupancy)))
-    booking_velocity = max(0.1, float(booking_velocity or 1.0))
+    pace_signals = _resolve_pace_signals(
+        booking_velocity=booking_velocity,
+        gross_pace_index=gross_pace_index,
+        retained_pace_index=retained_pace_index,
+        pickup_trend_index=pickup_trend_index,
+        pricing_pace_index=pricing_pace_index,
+    )
+    booking_velocity = pace_signals["booking_velocity"]
+    gross_pace_index = pace_signals["gross_pace_index"]
+    retained_pace_index = pace_signals["retained_pace_index"]
+    pickup_trend_index = pace_signals["pickup_trend_index"]
+    pricing_pace_index = pace_signals["pricing_pace_index"]
     market_context = normalize_market_context(market_context, competitor_price)
     competitor_price = market_context.get("comp_median")
     raw_otb_occupancy = _finite_float(raw_otb_occupancy)
@@ -309,17 +468,8 @@ def calculate_recommended_price(
         adjusted_otb_occupancy = max(0.0, min(1.0, adjusted_otb_occupancy))
     expected_cancellations = max(0.0, float(expected_cancellations or 0.0))
     sold_out = _is_sold_out(raw_otb_occupancy)
-    recommended_price = float(base_price)
     applied_rules = []
     components = []
-
-    _add_component(
-        components,
-        "Base rate",
-        0,
-        recommended_price,
-        "Starting public rate before demand, calendar, market, or safety adjustments.",
-    )
 
     manual_shock = float(manual_shock or 0.0)
     local_intel_shock = float(local_intel_shock or 0.0)
@@ -328,22 +478,48 @@ def calculate_recommended_price(
 
     manual_occ = max(0.0, min(1.0, organic_occupancy + manual_shock))
     demand_anchor = max(0.0, min(1.0, manual_occ + local_intel_shock))
-    if booking_velocity > 1.0:
-        demand_anchor *= 1 + min(0.12, (booking_velocity - 1.0) * 0.20)
-    elif booking_velocity < 1.0:
-        demand_anchor *= 1 - min(0.12, (1.0 - booking_velocity) * 0.25)
+    if pricing_pace_index > 1.0:
+        demand_anchor *= 1 + min(0.12, (pricing_pace_index - 1.0) * 0.20)
+    elif pricing_pace_index < 1.0:
+        demand_anchor *= 1 - min(0.12, (1.0 - pricing_pace_index) * 0.25)
     demand_anchor = max(0.0, min(1.0, demand_anchor))
 
-    elasticity = _dynamic_elasticity(demand_anchor, booking_velocity, local_intel_shock)
+    elasticity = _dynamic_elasticity(demand_anchor, pricing_pace_index, local_intel_shock)
     lead_time_days = _lead_time_days(target_date, market_context)
     compression = _compression_profile(
         demand_anchor,
-        booking_velocity,
+        gross_pace_index,
+        pickup_trend_index,
         raw_otb_occupancy,
         adjusted_otb_occupancy,
         local_intel_shock,
         lead_time_days,
         market_context.get("market_regime"),
+    )
+    pricing_policy = _dynamic_price_policy(
+        target_date,
+        market_context,
+        compression["allowed_premium_pct"],
+    )
+    base_price = pricing_policy["base_price"]
+    min_price = pricing_policy["min_price"]
+    max_price = pricing_policy["max_price"]
+    recommended_price = float(base_price)
+
+    _add_component(
+        components,
+        "Base rate",
+        0,
+        recommended_price,
+        (
+            f"Recent-history base rate from the last {pricing_policy['lookback_days']} days: "
+            f"{DYNAMIC_BASE_DOW_WEIGHT * 100:.0f}% same-weekday median ADR "
+            f"(${pricing_policy['same_weekday_median_adr']:.2f}) and "
+            f"{(1 - DYNAMIC_BASE_DOW_WEIGHT) * 100:.0f}% overall median ADR "
+            f"(${pricing_policy['recent_median_adr']:.2f})."
+            if not pricing_policy["used_fallback"]
+            else "Fallback public base rate used because recent ADR history was unavailable."
+        ),
     )
     reference_price = float(base_price)
     if competitor_price is not None:
@@ -354,10 +530,10 @@ def calculate_recommended_price(
             + (competitor_price * market_pull)
             + compression_lift
         )
-        reference_price = max(MIN_PRICE, min(MAX_PRICE, reference_price))
+        reference_price = max(min_price, min(max_price, reference_price))
 
     candidates = []
-    for candidate in _candidate_prices():
+    for candidate in _candidate_prices(min_price, max_price):
         expected_occupancy = _estimate_expected_occupancy(
             candidate,
             demand_anchor,
@@ -387,7 +563,7 @@ def calculate_recommended_price(
         "Demand anchor",
         recommended_price,
         recommended_price,
-        f"Priced demand anchor is {round(demand_anchor * 100)}% after forecast/current occupancy, manual demand, local intel, and booking pace.",
+        f"Priced demand anchor is {round(demand_anchor * 100)}% after forecast/current occupancy, manual demand, local intel, and composite pace signals.",
     )
     _add_component(
         components,
@@ -436,13 +612,13 @@ def calculate_recommended_price(
         _add_component(components, "Sold-out floor", floor_before, recommended_price, floor_explanation)
 
     before_guardrail = recommended_price
-    recommended_price = max(MIN_PRICE, min(MAX_PRICE, recommended_price))
+    recommended_price = max(min_price, min(max_price, recommended_price))
     _add_component(
         components,
         "Final recommendation",
         before_guardrail,
         recommended_price,
-        f"Safety bounds enforced between ${MIN_PRICE:.2f} and ${MAX_PRICE:.2f}.",
+        f"Dynamic safety bounds enforced between ${min_price:.2f} and ${max_price:.2f}.",
     )
 
     final_price = round(recommended_price, 2)
@@ -461,7 +637,7 @@ def calculate_recommended_price(
         reference_price,
         market_context,
         demand_anchor,
-        booking_velocity,
+        pickup_trend_index,
         manual_event_text,
         local_intel_shock,
         sold_out=sold_out,
@@ -473,8 +649,12 @@ def calculate_recommended_price(
 
     breakdown = {
         "base_price": _round_money(base_price),
+        "static_base_price": _round_money(BASE_PRICE),
         "reference_price": _round_money(reference_price),
         "final_price": final_price,
+        "dynamic_min_price": _round_money(min_price),
+        "dynamic_max_price": _round_money(max_price),
+        "pricing_policy": pricing_policy,
         "occupancy_used": round(occupancy, 4),
         "pre_shock_occupancy": round(organic_occupancy, 4),
         "raw_otb_occupancy": round(raw_otb_occupancy, 4) if raw_otb_occupancy is not None else None,
@@ -490,6 +670,10 @@ def calculate_recommended_price(
         "manual_shock": round(manual_shock, 4),
         "local_intel_shock": round(local_intel_shock, 4),
         "booking_velocity": round(booking_velocity, 4),
+        "gross_pace_index": round(gross_pace_index, 4),
+        "retained_pace_index": round(retained_pace_index, 4),
+        "pickup_trend_index": round(pickup_trend_index, 4),
+        "pricing_pace_index": round(pricing_pace_index, 4),
         "elasticity": round(elasticity, 4),
         "day_name": day_name,
         "competitor_price": _round_money(competitor_price) if competitor_price is not None else None,

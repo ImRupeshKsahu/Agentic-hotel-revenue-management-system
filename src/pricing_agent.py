@@ -68,8 +68,12 @@ class AgentState(TypedDict):
     historical_avg_otb: int
     market_state: Dict[str, Any]
     
-    # New Pace Variable: 1.0 is normal, >1.0 is fast booking, <1.0 is slow
-    booking_velocity: float 
+    # Pace signals: booking_velocity is kept as a legacy alias for gross pace.
+    booking_velocity: float
+    gross_pace_index: float
+    retained_pace_index: float
+    pickup_trend_index: float
+    pricing_pace_index: float
     
     # Internal Logic
     optimized_price: float
@@ -161,12 +165,23 @@ def _needs_manager_rewrite(summary: str, state: AgentState | None = None) -> boo
     )
 
 
-def _pace_phrase(booking_velocity: float) -> str:
-    if booking_velocity >= 1.20:
-        return f"pickup is running {round((booking_velocity - 1) * 100)}% ahead of normal pace"
-    if booking_velocity <= 0.80:
-        return f"pickup is running {round((1 - booking_velocity) * 100)}% behind normal pace"
-    return "pickup is close to normal pace"
+def _pace_clause(label: str, value: float) -> str:
+    if value >= 1.20:
+        return f"{label} is {round((value - 1) * 100)}% ahead of normal"
+    if value <= 0.80:
+        return f"{label} is {round((1 - value) * 100)}% behind normal"
+    return f"{label} is close to normal"
+
+
+def _pace_phrase(gross_pace_index: float, pickup_trend_index: float) -> str:
+    gross_clause = _pace_clause("booked pace", gross_pace_index)
+    if pickup_trend_index >= 1.20:
+        pickup_clause = "recent pickup is accelerating"
+    elif pickup_trend_index <= 0.80:
+        pickup_clause = "recent pickup is slowing"
+    else:
+        pickup_clause = "recent pickup is steady"
+    return f"{gross_clause}, and {pickup_clause}"
 
 
 def _manager_summary(state: AgentState, action: str) -> str:
@@ -180,7 +195,8 @@ def _manager_summary(state: AgentState, action: str) -> str:
         _safe_float(state.get("current_occupancy")),
     )
     forecasted_occupancy = _safe_float(state.get("forecasted_occupancy"))
-    booking_velocity = _safe_float(state.get("booking_velocity"), 1.0)
+    gross_pace_index = _safe_float(state.get("gross_pace_index"), _safe_float(state.get("booking_velocity"), 1.0))
+    pickup_trend_index = _safe_float(state.get("pickup_trend_index"), gross_pace_index)
     market_context = state.get("market_context") or {}
     competitor_price = _safe_float(market_context.get("comp_median"), _safe_float(state.get("competitor_price"), 0.0))
     competitor_phrase = (
@@ -209,7 +225,7 @@ def _manager_summary(state: AgentState, action: str) -> str:
 
     return (
         f"The recommended ADR is ${adr:.2f} because {occupancy_context}. "
-        f"{_pace_phrase(booking_velocity).capitalize()}, and {competitor_phrase[0].lower() + competitor_phrase[1:]} "
+        f"{_pace_phrase(gross_pace_index, pickup_trend_index).capitalize()}, and {competitor_phrase[0].lower() + competitor_phrase[1:]} "
         f"{action_sentence}"
     )
 
@@ -255,25 +271,17 @@ def _format_component_row(component: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _build_price_path_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
+def _build_price_path_components(state: AgentState) -> List[Dict[str, Any]]:
     breakdown = state.get("pricing_breakdown", {})
-    reference_price = _safe_float(breakdown.get("reference_price"), _safe_float(state.get("rule_based_price"), MIN_PRICE))
 
     component_drivers = ["Base rate", "Reference price", "Candidate optimization"]
     if breakdown.get("sold_out"):
         component_drivers.append("Sold-out floor")
     component_drivers.append("Final recommendation")
-    rows = [
+    return [
         _format_component_row(_find_component(breakdown, driver))
         for driver in component_drivers
     ]
-    rows.append({
-        "Driver": "Reference delta",
-        "Adjustment": f"${_money(final_adr - reference_price):+.2f}",
-        "Price After": f"${final_adr:.2f}",
-        "Why": "Final optimizer ADR compared with the blended reference price.",
-    })
-    return rows
 
 
 def _build_decision_context_components(state: AgentState, final_adr: float) -> List[Dict[str, Any]]:
@@ -287,7 +295,17 @@ def _build_decision_context_components(state: AgentState, final_adr: float) -> L
         {
             "Signal": "Retained OTB after cancellations",
             "Value": f"{round(_safe_float(breakdown.get('adjusted_otb_occupancy'), 0.0) * 100)}%",
-            "Why it matters": "Cancellation-adjusted OTB remains the demand signal used in pricing.",
+            "Why it matters": "Cancellation-adjusted OTB remains a core demand signal used in pricing.",
+        },
+        {
+            "Signal": "Gross booked pace",
+            "Value": f"{_safe_float(breakdown.get('gross_pace_index'), 1.0):.2f}x",
+            "Why it matters": "Raw pace helps describe scarcity versus normal historical booking levels.",
+        },
+        {
+            "Signal": "Recent pickup trend",
+            "Value": f"{_safe_float(breakdown.get('pickup_trend_index'), 1.0):.2f}x",
+            "Why it matters": "Recent pickup shows whether demand is accelerating or slowing now.",
         },
     ]
     for driver in ["Demand anchor", "Competitor signal"]:
@@ -330,6 +348,10 @@ def data_ingestion_node(state: AgentState):
     """
     date_data = state.get("market_state") or {}
     velocity = float(date_data.get("booking_velocity", state.get("booking_velocity", 1.0)))
+    gross_pace_index = float(date_data.get("gross_pace_index", state.get("gross_pace_index", velocity)))
+    retained_pace_index = float(date_data.get("retained_pace_index", state.get("retained_pace_index", gross_pace_index)))
+    pickup_trend_index = float(date_data.get("pickup_trend_index", state.get("pickup_trend_index", gross_pace_index)))
+    pricing_pace_index = float(date_data.get("pricing_pace_index", state.get("pricing_pace_index", velocity)))
     raw_market_context = {
         "comp_low": date_data.get("comp_low"),
         "comp_median": date_data.get("comp_median"),
@@ -358,6 +380,10 @@ def data_ingestion_node(state: AgentState):
 
     return {
         "booking_velocity": velocity,
+        "gross_pace_index": gross_pace_index,
+        "retained_pace_index": retained_pace_index,
+        "pickup_trend_index": pickup_trend_index,
+        "pricing_pace_index": pricing_pace_index,
         "competitor_price": competitor_price,
         "market_context": market_context,
         "raw_otb_occupancy": raw_otb_occupancy,
@@ -387,6 +413,10 @@ def optimizer_node(state: AgentState):
         manual_shock=manual_shock,
         local_intel_shock=local_intel_shock,
         booking_velocity=state.get("booking_velocity", 1.0),
+        gross_pace_index=state.get("gross_pace_index"),
+        retained_pace_index=state.get("retained_pace_index"),
+        pickup_trend_index=state.get("pickup_trend_index"),
+        pricing_pace_index=state.get("pricing_pace_index"),
         manual_event_text=state.get("manual_event_text", ""),
         raw_otb_occupancy=state.get("raw_otb_occupancy"),
         adjusted_otb_occupancy=adjusted_otb_occupancy,
@@ -465,23 +495,33 @@ def pace_analyst_node(state: AgentState):
     Velocity > 1.2 means we are 'AHEAD' of pace.
     Velocity < 0.8 means we are 'BEHIND' pace.
     """
-    velocity = state.get('booking_velocity', 1.0)
-    pace_status = "Normal"
-    
-    if velocity > 1.2:
-        pace_status = "Aggressive Pickup (Ahead of Pace)"
-    elif velocity < 0.8:
-        pace_status = "Sluggish Demand (Behind Pace)"
-        
-    # We add this finding to the logic flags for the LLM to see
-    new_flags = state['logic_flags'] + [f"Booking Pace Status: {pace_status}"]
+    gross_pace_index = state.get("gross_pace_index", state.get("booking_velocity", 1.0))
+    pickup_trend_index = state.get("pickup_trend_index", gross_pace_index)
+    booked_pace_status = "Normal"
+    recent_pickup_status = "Steady"
+
+    if gross_pace_index > 1.2:
+        booked_pace_status = "Ahead of Historical Pace"
+    elif gross_pace_index < 0.8:
+        booked_pace_status = "Behind Historical Pace"
+
+    if pickup_trend_index > 1.2:
+        recent_pickup_status = "Accelerating"
+    elif pickup_trend_index < 0.8:
+        recent_pickup_status = "Slowing"
+
+    new_flags = state["logic_flags"] + [
+        f"Booked Pace Status: {booked_pace_status}",
+        f"Recent Pickup Status: {recent_pickup_status}",
+    ]
     
     return {"logic_flags": new_flags}
 
 # --- NODE 3: THE AI STRATEGIST ---
 def strategist_node(state: AgentState):
-    pace_info = next((f for f in state['logic_flags'] if "Pace" in f), "Pace: Normal")
-    non_pace_flags = [f for f in state["logic_flags"] if "Pace" not in f]
+    pace_flags = [f for f in state["logic_flags"] if "Pace" in f or "Pickup" in f]
+    pace_info = "; ".join(pace_flags) if pace_flags else "Booked Pace Status: Normal; Recent Pickup Status: Steady"
+    non_pace_flags = [f for f in state["logic_flags"] if "Pace" not in f and "Pickup" not in f]
     optimized_price = _safe_float(state.get("optimized_price"), MIN_PRICE)
     breakdown = state.get("pricing_breakdown", {})
     diagnostics = state.get("optimizer_diagnostics", {})
@@ -505,7 +545,11 @@ def strategist_node(state: AgentState):
                    "comp_low": _safe_float((state.get("market_context") or {}).get("comp_low"), 0.0),
                    "comp_median": _safe_float((state.get("market_context") or {}).get("comp_median"), 0.0),
                    "comp_high": _safe_float((state.get("market_context") or {}).get("comp_high"), 0.0),
-                   "booking_velocity":state['booking_velocity'],
+                   "booking_velocity":state["booking_velocity"],
+                   "gross_pace_index":state["gross_pace_index"],
+                   "retained_pace_index":state["retained_pace_index"],
+                   "pickup_trend_index":state["pickup_trend_index"],
+                   "pricing_pace_index":state["pricing_pace_index"],
                    "manual_demand_shock":state.get('manual_demand_shock', state.get('demand_shock', 0.0))* 100,
                    "local_intel_suggested_shock":state.get('local_intel_suggested_shock', 0.0)* 100,
                    "local_intel_applied_shock":state.get('local_intel_applied_shock', 0.0)* 100,
@@ -632,8 +676,8 @@ def validation_node(state: AgentState):
         "manual_approval_required": manual_approval_required,
         "strategy_applied": action,
         "strategic_reasoning": owner_summary,
-        "price_components": _build_price_path_components(state, final_adr),
-        "price_path_components": _build_price_path_components(state, final_adr),
+        "price_components": _build_price_path_components(state),
+        "price_path_components": _build_price_path_components(state),
         "decision_context_components": _build_decision_context_components(state, final_adr),
         "market_context": state.get("market_context", {}),
         "local_intel_estimate": state.get("local_intel_estimate", {}),
@@ -673,6 +717,10 @@ def run_agentic_pricing(
     competitor_price=120.0,
     market_context=None,
     booking_velocity=1.0,
+    gross_pace_index=None,
+    retained_pace_index=None,
+    pickup_trend_index=None,
+    pricing_pace_index=None,
     historical_avg_otb=1,
     market_state=None,
     manual_demand_shock=None,
@@ -718,6 +766,19 @@ def run_agentic_pricing(
         competitor_price,
     )
     competitor_price = _safe_float(resolved_market_context.get("comp_median"), competitor_price)
+    gross_pace_index = _safe_float(gross_pace_index, _safe_float(market_state.get("gross_pace_index"), booking_velocity))
+    retained_pace_index = _safe_float(
+        retained_pace_index,
+        _safe_float(market_state.get("retained_pace_index"), gross_pace_index),
+    )
+    pickup_trend_index = _safe_float(
+        pickup_trend_index,
+        _safe_float(market_state.get("pickup_trend_index"), gross_pace_index),
+    )
+    pricing_pace_index = _safe_float(
+        pricing_pace_index,
+        _safe_float(market_state.get("pricing_pace_index"), booking_velocity),
+    )
     agent = create_pricing_agent()
     result = agent.invoke({
         "target_date": target_date,
@@ -730,6 +791,10 @@ def run_agentic_pricing(
         "competitor_price": competitor_price,
         "market_context": resolved_market_context,
         "booking_velocity": booking_velocity,
+        "gross_pace_index": gross_pace_index,
+        "retained_pace_index": retained_pace_index,
+        "pickup_trend_index": pickup_trend_index,
+        "pricing_pace_index": pricing_pace_index,
         "historical_avg_otb": historical_avg_otb,
         "market_state": market_state,
         "demand_shock": total_shock,
@@ -755,6 +820,10 @@ def _append_pricing_decision_log(result: Dict[str, Any]) -> None:
         "raw_otb_occupancy": result.get("raw_otb_occupancy"),
         "adjusted_otb_occupancy": result.get("adjusted_otb_occupancy"),
         "booking_velocity": result.get("booking_velocity"),
+        "gross_pace_index": result.get("gross_pace_index"),
+        "retained_pace_index": result.get("retained_pace_index"),
+        "pickup_trend_index": result.get("pickup_trend_index"),
+        "pricing_pace_index": result.get("pricing_pace_index"),
         "market_context": result.get("market_context") or breakdown.get("market_context"),
         "selected_adr": result.get("final_adr"),
         "compression_score": breakdown.get("compression_score"),

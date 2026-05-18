@@ -15,7 +15,12 @@
     - Optimizer Expected Revenue: ${expected_revenue:.2f}
     - Competitor Median: ${comp_median:.2f}
     - Competitor Range: ${comp_low:.2f} to ${comp_high:.2f}
-    - Momentum: {pace_info} (Booking Velocity: {booking_velocity}x)
+    - Momentum: {pace_info}
+    - Gross Booked Pace: {gross_pace_index}x
+    - Retained Pace: {retained_pace_index}x
+    - Recent Pickup Trend: {pickup_trend_index}x
+    - Pricing Pace Index Used By Optimizer: {pricing_pace_index}x
+    - Legacy Booking Velocity Alias: {booking_velocity}x
     - Manual Demand Adjustment Included In Optimizer: {manual_demand_shock:.1f}%
     - Local Intel Suggested Demand Impact: {local_intel_suggested_shock:.1f}%
     - Local Intel Included In Optimizer: {local_intel_applied_label}

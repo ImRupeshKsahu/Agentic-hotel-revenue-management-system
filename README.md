@@ -53,3 +53,7 @@ python -m unittest discover -s tests
 - Historical occupancy data covers July 1, 2015 through September 6, 2017.
 - `.env` is ignored by git and should not be committed.
 - Generated caches, model binaries, plots, and backtest outputs are ignored so the GitHub repo stays source-focused.
+
+## Project documentation
+
+- Pricing architecture and presentation notes: `docs/pricing_optimization_summary.md`

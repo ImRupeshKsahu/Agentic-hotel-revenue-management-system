@@ -60,7 +60,9 @@ def estimate_local_intel_impact(
     text: str,
     current_occ: float,
     forecast_occ: float,
-    booking_velocity: float,
+    booking_velocity: float = 1.0,
+    retained_pace_index: float | None = None,
+    pickup_trend_index: float | None = None,
 ) -> Dict[str, Any]:
     """Conservative rule-based local intel estimator.
 
@@ -82,6 +84,8 @@ def estimate_local_intel_impact(
     current_occ = max(0.0, min(1.0, float(current_occ or 0.0)))
     forecast_occ = max(0.0, min(1.0, float(forecast_occ or 0.0)))
     booking_velocity = float(booking_velocity or 1.0)
+    retained_pace_index = float(retained_pace_index if retained_pace_index is not None else booking_velocity)
+    pickup_trend_index = float(pickup_trend_index if pickup_trend_index is not None else booking_velocity)
 
     demand_terms = [
         "wedding", "marriage", "banquet", "concert", "conference", "convention",
@@ -148,9 +152,9 @@ def estimate_local_intel_impact(
 
         if is_major_sports_event:
             suggested = 0.05
-            if forecast_occ > 0.90 or booking_velocity > 1.2:
+            if forecast_occ > 0.90 or retained_pace_index > 1.2 or pickup_trend_index > 1.2:
                 suggested = 0.10
-            elif forecast_occ > 0.80 or booking_velocity > 1.1:
+            elif forecast_occ > 0.80 or retained_pace_index > 1.1 or pickup_trend_index > 1.1:
                 suggested = 0.08
             return _build_result(
                 classification="Event",
@@ -163,7 +167,7 @@ def estimate_local_intel_impact(
 
         if _has_numbered_group(normalized) or _contains_any(normalized, ["wedding", "conference", "convention", "expo", "summit"]):
             suggested = 0.08
-            if forecast_occ > 0.90 or booking_velocity > 1.2:
+            if forecast_occ > 0.90 or retained_pace_index > 1.2 or pickup_trend_index > 1.2:
                 suggested = 0.10
             return _build_result(
                 classification="Event",

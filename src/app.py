@@ -10,6 +10,13 @@ from config import BASE_PRICE,BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH
 from pricing_engine import calculate_recommended_price
 from pricing_agent import run_agentic_pricing
 from local_intel_estimator import estimate_local_intel_impact
+from manager_copilot import (
+    build_briefing_payload,
+    build_opportunity_records,
+    generate_executive_briefing,
+    rank_top_opportunities,
+    rank_top_risks,
+)
 from utils.utility_functions import normalize_reasoning
 
 # --- PATH SETUP ---
@@ -63,6 +70,13 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
                 entry.setdefault("sample_size", 1)
                 entry.setdefault("source_quality", "legacy_single_rate")
                 entry.setdefault("market_regime", "legacy_single_rate")
+                entry.setdefault("booked_adr", entry.get("otb_adr", entry.get("competitor_price")))
+                legacy_velocity = float(entry.get("booking_velocity", 1.0))
+                entry.setdefault("gross_pace_index", legacy_velocity)
+                entry.setdefault("retained_pace_index", legacy_velocity)
+                entry.setdefault("pickup_trend_index", legacy_velocity)
+                entry.setdefault("pricing_pace_index", legacy_velocity)
+                entry.setdefault("pace_confidence", "low")
             return cached_state
 
     if not os.path.exists(otb_path):
@@ -98,11 +112,14 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
 
     state = {}
     for row in otb_df.itertuples(index=False):
-        velocity = float(getattr(row, "Booking_Velocity", 1.0))
+        gross_pace_index = float(getattr(row, "Gross_Pace_Index", getattr(row, "Booking_Velocity", 1.0)))
+        retained_pace_index = float(getattr(row, "Retained_Pace_Index", gross_pace_index))
+        pickup_trend_index = float(getattr(row, "Pickup_Trend_Index", gross_pace_index))
+        pricing_pace_index = float(getattr(row, "Pricing_Pace_Index", gross_pace_index))
         status = "Normal"
-        if velocity >= 1.2:
+        if gross_pace_index >= 1.2:
             status = "Ahead of historical pace"
-        elif velocity <= 0.8:
+        elif gross_pace_index <= 0.8:
             status = "Behind historical pace"
 
         competitor_price = getattr(row, "Competitor_Rate", pd.NA)
@@ -133,6 +150,7 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
                 )
             ),
             "historical_avg_otb": int(getattr(row, "Historical_Avg_OTB", 1)),
+            "booked_adr": float(getattr(row, "OTB_ADR", getattr(row, "Competitor_Rate", 0.0))),
             "competitor_price": round(float(comp_median), 2),
             "comp_low": round(float(comp_low), 2),
             "comp_median": round(float(comp_median), 2),
@@ -142,7 +160,15 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
             "market_regime": getattr(row, "market_regime", "legacy_single_rate"),
             "market_as_of_timestamp": getattr(row, "as_of_timestamp", None),
             "total_rooms": int(getattr(row, "Capacity", BASE_CAPACITY)),
-            "booking_velocity": velocity,
+            "gross_otb": int(getattr(row, "Gross_OTB", getattr(row, "Live_OTB", 0))),
+            "net_pickup_7d": int(getattr(row, "Net_Pickup_7d", 0)),
+            "historical_net_pickup_7d": int(getattr(row, "Historical_Net_Pickup_7d", 0)),
+            "gross_pace_index": gross_pace_index,
+            "retained_pace_index": retained_pace_index,
+            "pickup_trend_index": pickup_trend_index,
+            "pricing_pace_index": pricing_pace_index,
+            "pace_confidence": getattr(row, "Pace_Confidence", "low"),
+            "booking_velocity": gross_pace_index,
             "status": status,
         }
     return state
@@ -177,15 +203,189 @@ def adjusted_otb_occupancy(live_entry):
 def humanize_label(value):
     return str(value).replace("_", " ").strip().title()
 
+
+def format_pct(value):
+    return f"{float(value) * 100:.1f}%"
+
+
+def build_today_snapshot_rows(records):
+    return [
+        {
+            "Date": row["date"],
+            "ADR": f"${row['recommended_adr']:.2f}",
+            "Booked": format_pct(row["raw_otb_occupancy"]),
+            "Retained OTB": format_pct(row["adjusted_otb_occupancy"]),
+            "Forecast": format_pct(row["forecasted_occupancy"]),
+            "Pickup": f"{row['pickup_trend_index']:.2f}x",
+            "Comp Median": f"${row['competitor_median']:.2f}",
+            "Upside vs Booked ADR": f"${row['revenue_upside']:,.0f}",
+            "Review Status": row["review_status"],
+        }
+        for row in records
+    ]
+
+
+def build_manager_table_rows(records):
+    return [
+        {
+            "Date": row["date"],
+            "ADR": f"${row['recommended_adr']:.2f}",
+            "Upside vs Booked ADR": f"${row['revenue_upside']:,.0f}",
+            "Booked": format_pct(row["raw_otb_occupancy"]),
+            "Forecast": format_pct(row["forecasted_occupancy"]),
+            "Why it matters": " ".join(row["top_reasons"]),
+        }
+        for row in records
+    ]
+
+
+BRIEFING_POLICY_VERSION = 3
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def executive_briefing_cached(payload_json, policy_version):
+    return generate_executive_briefing(json.loads(payload_json))
+
+
+def render_price_trace(agent_result):
+    st.subheader("Price Path")
+    price_path_components = agent_result.get("price_path_components", agent_result.get("price_components", []))
+    if price_path_components:
+        st.dataframe(pd.DataFrame(price_path_components), use_container_width=True, hide_index=True)
+    else:
+        fallback_rows = [
+            {"Driver": "Base rate", "Adjustment": "$+0.00", "Price After": f"${BASE_PRICE:.2f}", "Why": "Starting public rate."},
+            {"Driver": "Optimizer ADR", "Adjustment": f"${agent_result['final_adr'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Deterministic candidate-price optimizer output."},
+        ]
+        st.dataframe(pd.DataFrame(fallback_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("Decision Context")
+    decision_context_components = agent_result.get("decision_context_components", [])
+    if decision_context_components:
+        st.dataframe(pd.DataFrame(decision_context_components), use_container_width=True, hide_index=True)
+    else:
+        fallback_context_rows = [
+            {"Signal": "AI advisory", "Value": "Review only", "Why it matters": "AI reviewed the decision without changing ADR."},
+        ]
+        st.dataframe(pd.DataFrame(fallback_context_rows), use_container_width=True, hide_index=True)
+
+    guardrail_rows = [{"Guardrail": item} for item in agent_result.get("guardrails_applied", [])]
+    if guardrail_rows:
+        st.subheader("Guardrail Audit")
+        st.dataframe(pd.DataFrame(guardrail_rows), use_container_width=True, hide_index=True)
+
 # 4. Sidebar Navigation
 st.sidebar.header("🕹️ System Controls")
-app_mode = st.sidebar.radio("Switch View", ["📈 Market Performance", "🤖 Agentic Simulation"])
+app_mode = st.sidebar.radio("Switch View", ["Today", "📈 Market Performance", "🤖 Agentic Simulation"])
 forecast_df = load_forecast_output_cached(FORECAST_OUTPUT_PATH, file_mtime(FORECAST_OUTPUT_PATH))
 
 # ==========================================
-# PAGE 1: MARKET PERFORMANCE (Live Status)
+# PAGE 1: TODAY (Manager Copilot)
 # ==========================================
-if app_mode == "📈 Market Performance":
+if app_mode == "Today":
+    st.subheader("Today")
+    live_data = load_live_market_data()
+    opportunity_records = build_opportunity_records(forecast_df, live_data)
+    top_opportunities = rank_top_opportunities(opportunity_records)
+    top_risks = rank_top_risks(opportunity_records)
+    briefing_payload = build_briefing_payload(opportunity_records)
+    briefing = executive_briefing_cached(json.dumps(briefing_payload, sort_keys=True), BRIEFING_POLICY_VERSION)
+
+    st.subheader("Executive Briefing")
+    st.info(normalize_reasoning(briefing))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Top Revenue Opportunities")
+        if top_opportunities:
+            st.dataframe(
+                pd.DataFrame(build_manager_table_rows(top_opportunities)),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("No material revenue upside stands out right now.")
+    with c2:
+        st.subheader("Top Risks / Review Needed")
+        if top_risks:
+            risk_rows = [
+                {
+                    "Date": row["date"],
+                    "ADR": f"${row['recommended_adr']:.2f}",
+                    "Review Status": row["review_status"],
+                    "Why review": " ".join(row["review_flags"][:2]),
+                }
+                for row in top_risks
+            ]
+            st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+        else:
+            st.success("No dates currently require special review before publishing.")
+
+    st.subheader("30-Day Snapshot")
+    st.dataframe(
+        pd.DataFrame(build_today_snapshot_rows(opportunity_records)),
+        use_container_width=True,
+        height=360,
+        hide_index=True,
+    )
+
+    inspectable_dates = [record["date"] for record in opportunity_records]
+    default_date = top_opportunities[0]["date"] if top_opportunities else inspectable_dates[0]
+    selected_date = st.selectbox(
+        "Inspect date",
+        inspectable_dates,
+        index=inspectable_dates.index(default_date),
+        help="Choose any date from the opportunity or risk tables to inspect the full pricing trace.",
+    )
+    selected_record = next(record for record in opportunity_records if record["date"] == selected_date)
+    selected_state = live_data.get(selected_date, {})
+    agent_result = run_agentic_pricing(
+        target_date=selected_date,
+        current_occupancy=selected_record["adjusted_otb_occupancy"],
+        forecasted_occupancy=selected_record["forecasted_occupancy"],
+        shock=0.0,
+        competitor_price=selected_record["competitor_median"],
+        market_context={
+            "comp_low": selected_state.get("comp_low"),
+            "comp_median": selected_state.get("comp_median"),
+            "comp_high": selected_state.get("comp_high"),
+            "sample_size": selected_state.get("sample_size", 1),
+            "source_quality": selected_state.get("source_quality"),
+            "market_regime": selected_state.get("market_regime"),
+            "market_as_of_timestamp": selected_state.get("market_as_of_timestamp"),
+        },
+        booking_velocity=float(selected_state.get("booking_velocity", 1.0)),
+        gross_pace_index=float(selected_state.get("gross_pace_index", selected_state.get("booking_velocity", 1.0))),
+        retained_pace_index=float(selected_state.get("retained_pace_index", selected_state.get("booking_velocity", 1.0))),
+        pickup_trend_index=float(selected_state.get("pickup_trend_index", selected_state.get("booking_velocity", 1.0))),
+        pricing_pace_index=float(selected_state.get("pricing_pace_index", selected_state.get("booking_velocity", 1.0))),
+        historical_avg_otb=int(selected_state.get("historical_avg_otb", 1)),
+        market_state=selected_state,
+        raw_otb_occupancy=selected_record["raw_otb_occupancy"],
+        adjusted_otb_occupancy=selected_record["adjusted_otb_occupancy"],
+        expected_cancellations=float(selected_state.get("expected_cancellations", 0.0)),
+        record_decision=False,
+    )
+
+    st.subheader(f"Date Detail — {selected_date}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Recommended ADR", f"${selected_record['recommended_adr']:.2f}")
+    c2.metric("Current Booked", format_pct(selected_record["raw_otb_occupancy"]))
+    c3.metric("Retained OTB", format_pct(selected_record["adjusted_otb_occupancy"]))
+    c4.metric("Forecast Occupancy", format_pct(selected_record["forecasted_occupancy"]))
+    st.caption(
+        f"Competitor median: ${selected_record['competitor_median']:.2f} | "
+        f"Booked ADR: ${selected_record['booked_adr']:.2f} | "
+        f"Upside vs booked ADR: ${selected_record['revenue_upside']:,.0f} | "
+        f"Review status: {selected_record['review_status']}"
+    )
+    st.info(normalize_reasoning(agent_result["strategic_reasoning"]))
+    render_price_trace(agent_result)
+
+# ==========================================
+# PAGE 2: MARKET PERFORMANCE (Live Status)
+# ==========================================
+elif app_mode == "📈 Market Performance":
     st.subheader("Real-Time Market & Baseline Strategy")
     
     live_data = load_live_market_data()
@@ -231,6 +431,10 @@ if app_mode == "📈 Market Performance":
             target_date=d_str,
             competitor_price=live_entry.get('competitor_price', 120.0),
             booking_velocity=live_entry.get('booking_velocity', 1.0),
+            gross_pace_index=live_entry.get('gross_pace_index'),
+            retained_pace_index=live_entry.get('retained_pace_index'),
+            pickup_trend_index=live_entry.get('pickup_trend_index'),
+            pricing_pace_index=live_entry.get('pricing_pace_index'),
             raw_otb_occupancy=float(live_entry.get('current_otb', 0)) / float(live_entry.get('total_rooms', BASE_CAPACITY) or BASE_CAPACITY),
             adjusted_otb_occupancy=adjusted_otb_occupancy(live_entry),
             expected_cancellations=live_entry.get('expected_cancellations', 0.0),
@@ -244,7 +448,8 @@ if app_mode == "📈 Market Performance":
             "Forecasted_occupancy":f"{min(round(row['Forecasted_Occupancy']*BASE_CAPACITY),237)}",
             "Comp_Price": f"${live_entry.get('competitor_price', 0):.2f}",
             "Recommended_Price": f"${price:.2f}",
-            "Booking_Velocity": f"{live_entry.get('booking_velocity', 1.0):.2f}x",
+            "Booked_Pace": f"{live_entry.get('gross_pace_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
+            "Recent_Pickup": f"{live_entry.get('pickup_trend_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
             "System_Status": live_entry.get('status', 'Normal')
         })
 
@@ -311,6 +516,10 @@ else:
             "adjusted_otb_occupancy": 50 / BASE_CAPACITY,
             "historical_avg_otb": 1,
             "competitor_price": 120.0,
+            "gross_pace_index": 1.0,
+            "retained_pace_index": 1.0,
+            "pickup_trend_index": 1.0,
+            "pricing_pace_index": 1.0,
             "booking_velocity": 1.0,
             "status": "Fallback snapshot",
         },
@@ -345,6 +554,8 @@ else:
         current_occ=current_occ,
         forecast_occ=forecasted_occ,
         booking_velocity=float(current_state.get("booking_velocity", 1.0)),
+        retained_pace_index=float(current_state.get("retained_pace_index", current_state.get("booking_velocity", 1.0))),
+        pickup_trend_index=float(current_state.get("pickup_trend_index", current_state.get("booking_velocity", 1.0))),
     )
 
     if manual_event:
@@ -385,7 +596,7 @@ else:
         with log_placeholder.container():
             st.write("🔍 **Node 1: Data Ingestion** - Using cached PMS-derived market snapshot...")
             st.write("📐 **Node 2: Price Optimizer** - Evaluating candidate ADRs and expected revenue...")
-            st.write("📈 **Node 3: Pace Analyst** - Reading prepared booking velocity...")
+            st.write("📈 **Node 3: Pace Analyst** - Reading booked pace and recent pickup...")
             st.write("🧠 **Node 4: AI Strategist** - Reviewing optimizer rationale and risk flags...")
 
         agent_result = run_agentic_pricing(
@@ -397,6 +608,10 @@ else:
             competitor_price=float(market_context.get("comp_median") or current_state.get("competitor_price", 120.0)),
             market_context=market_context,
             booking_velocity=float(current_state.get("booking_velocity", 1.0)),
+            gross_pace_index=float(current_state.get("gross_pace_index", current_state.get("booking_velocity", 1.0))),
+            retained_pace_index=float(current_state.get("retained_pace_index", current_state.get("booking_velocity", 1.0))),
+            pickup_trend_index=float(current_state.get("pickup_trend_index", current_state.get("booking_velocity", 1.0))),
+            pricing_pace_index=float(current_state.get("pricing_pace_index", current_state.get("booking_velocity", 1.0))),
             historical_avg_otb=int(current_state.get("historical_avg_otb", 1)),
             market_state=current_state,
             manual_demand_shock=demand_shock,
@@ -414,9 +629,9 @@ else:
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Final ADR", f"${agent_result['final_adr']:.2f}")
         c2.metric("Optimizer ADR", f"${agent_result.get('optimized_price', agent_result['rule_based_price']):.2f}")
-        c3.metric("Reference Delta", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
+        c3.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
         c4.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
-        c5.metric("Booking Pace", f"{agent_result['booking_velocity']}x")
+        c5.metric("Pricing Pace", f"{agent_result['pricing_pace_index']}x")
 
         st.markdown("---")
         
@@ -450,28 +665,4 @@ else:
             st.write(f"**Guardrails Applied:** {agent_result.get('guardrails_applied', [])}")
             st.write(f"**Manual Approval Required:** {agent_result.get('manual_approval_required', False)}")
 
-        st.subheader("Price Path")
-        price_path_components = agent_result.get("price_path_components", agent_result.get("price_components", []))
-        if price_path_components:
-            st.dataframe(pd.DataFrame(price_path_components), use_container_width=True, hide_index=True)
-        else:
-            fallback_rows = [
-                {"Driver": "Base rate", "Adjustment": "$+0.00", "Price After": f"${BASE_PRICE:.2f}", "Why": "Starting public rate."},
-                {"Driver": "Optimizer ADR", "Adjustment": f"${agent_result['final_adr'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Deterministic candidate-price optimizer output."},
-            ]
-            st.dataframe(pd.DataFrame(fallback_rows), use_container_width=True, hide_index=True)
-
-        st.subheader("Decision Context")
-        decision_context_components = agent_result.get("decision_context_components", [])
-        if decision_context_components:
-            st.dataframe(pd.DataFrame(decision_context_components), use_container_width=True, hide_index=True)
-        else:
-            fallback_context_rows = [
-                {"Signal": "AI advisory", "Value": "Review only", "Why it matters": "AI reviewed the decision without changing ADR."},
-            ]
-            st.dataframe(pd.DataFrame(fallback_context_rows), use_container_width=True, hide_index=True)
-
-        guardrail_rows = [{"Guardrail": item} for item in agent_result.get("guardrails_applied", [])]
-        if guardrail_rows:
-            st.subheader("Guardrail Audit")
-            st.dataframe(pd.DataFrame(guardrail_rows), use_container_width=True, hide_index=True)
+        render_price_trace(agent_result)

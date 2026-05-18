@@ -65,6 +65,10 @@ class MarketFeedTests(unittest.TestCase):
                 "Capacity": [237],
                 "Historical_Avg_OTB": [80],
                 "Booking_Velocity": [1.25],
+                "Gross_Pace_Index": [1.25],
+                "Retained_Pace_Index": [1.15],
+                "Pickup_Trend_Index": [1.30],
+                "Pricing_Pace_Index": [1.20],
             }
         )
         market = pd.DataFrame(
@@ -89,6 +93,10 @@ class MarketFeedTests(unittest.TestCase):
         self.assertEqual(day["comp_low"], 120.0)
         self.assertEqual(day["comp_high"], 150.0)
         self.assertEqual(day["market_regime"], "event_compression")
+        self.assertEqual(day["gross_pace_index"], 1.25)
+        self.assertEqual(day["retained_pace_index"], 1.15)
+        self.assertEqual(day["pickup_trend_index"], 1.30)
+        self.assertEqual(day["pricing_pace_index"], 1.20)
 
     def test_compression_allows_more_premium_than_soft_market(self):
         market_context = {
@@ -124,6 +132,31 @@ class MarketFeedTests(unittest.TestCase):
         self.assertLess(soft["allowed_premium_pct"], compressed["allowed_premium_pct"])
         self.assertLess(soft["compression_score"], compressed["compression_score"])
         self.assertGreater(compressed_price, market_context["comp_median"])
+
+    def test_pricing_uses_composite_pace_signal_when_available(self):
+        _, _, legacy = calculate_recommended_price(
+            occupancy=0.80,
+            day_name="Monday",
+            competitor_price=140.0,
+            booking_velocity=1.0,
+            return_breakdown=True,
+        )
+        _, _, richer = calculate_recommended_price(
+            occupancy=0.80,
+            day_name="Monday",
+            competitor_price=140.0,
+            booking_velocity=1.0,
+            gross_pace_index=1.0,
+            retained_pace_index=1.20,
+            pickup_trend_index=1.25,
+            pricing_pace_index=1.18,
+            return_breakdown=True,
+        )
+
+        self.assertEqual(legacy["pricing_pace_index"], 1.0)
+        self.assertEqual(richer["gross_pace_index"], 1.0)
+        self.assertEqual(richer["pricing_pace_index"], 1.18)
+        self.assertGreater(richer["demand_anchor"], legacy["demand_anchor"])
 
     def test_legacy_single_competitor_input_still_works(self):
         price, _, breakdown = calculate_recommended_price(

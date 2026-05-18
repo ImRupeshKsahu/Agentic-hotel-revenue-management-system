@@ -53,6 +53,33 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertTrue(breakdown["optimizer_candidates"])
         self.assertGreater(price, BASE_PRICE)
 
+    def test_dynamic_pricing_policy_uses_recent_history_and_live_comp_set(self):
+        price, _, breakdown = calculate_recommended_price(
+            occupancy=0.9178671921,
+            day_name="Friday",
+            target_date="2017-09-01",
+            market_context={
+                "comp_low": 130.40,
+                "comp_median": 138.99,
+                "comp_high": 148.68,
+                "sample_size": 5,
+                "source_quality": "simulated",
+                "market_regime": "normal_market",
+                "as_of_timestamp": "2017-08-31T00:00:00",
+            },
+            raw_otb_occupancy=1.0,
+            adjusted_otb_occupancy=0.6446,
+            return_breakdown=True,
+        )
+
+        self.assertEqual(breakdown["base_price"], 128.73)
+        self.assertEqual(breakdown["dynamic_min_price"], 123.88)
+        self.assertEqual(breakdown["dynamic_max_price"], 166.52)
+        self.assertEqual(breakdown["pricing_policy"]["recent_median_adr"], 130.0)
+        self.assertEqual(breakdown["pricing_policy"]["same_weekday_median_adr"], 128.18)
+        self.assertTrue(breakdown["pricing_policy"]["has_observed_comp_set"])
+        self.assertGreaterEqual(price, 138.99)
+
     def test_ai_suggestion_cannot_change_optimizer_price(self):
         pricing_agent.client = SimpleNamespace(
             chat=SimpleNamespace(
@@ -90,7 +117,6 @@ class ExplainablePricingTests(unittest.TestCase):
                 "Reference price",
                 "Candidate optimization",
                 "Final recommendation",
-                "Reference delta",
             ],
         )
         self.assertEqual(
@@ -98,12 +124,20 @@ class ExplainablePricingTests(unittest.TestCase):
             [
                 "Current booked occupancy",
                 "Retained OTB after cancellations",
+                "Gross booked pace",
+                "Recent pickup trend",
                 "Demand anchor",
                 "Competitor signal",
                 "Market premium headroom",
                 "AI advisory",
             ],
         )
+
+    def test_streamlit_metric_frames_reference_as_comparison(self):
+        app_source = (ROOT / "src" / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('c3.metric("ADR vs Reference"', app_source)
+        self.assertNotIn('c3.metric("Reference Delta"', app_source)
 
     def test_missing_ai_key_keeps_optimizer_price_with_clean_advisory(self):
         self._original_resolve_api_key = pricing_agent._resolve_api_key
@@ -215,6 +249,19 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertEqual(estimate["confidence"], "High")
         self.assertEqual(estimate["suggested_shock"], 0.15)
         self.assertTrue(estimate["apply_allowed"])
+
+    def test_recent_pickup_can_strengthen_event_signal(self):
+        estimate = estimate_local_intel_impact(
+            "100-person wedding block nearby",
+            current_occ=0.60,
+            forecast_occ=0.75,
+            booking_velocity=1.0,
+            retained_pace_index=1.0,
+            pickup_trend_index=1.25,
+        )
+
+        self.assertEqual(estimate["classification"], "Event")
+        self.assertEqual(estimate["suggested_shock"], 0.10)
 
     def test_fifa_world_cup_final_is_event(self):
         estimate = estimate_local_intel_impact(
