@@ -1,5 +1,7 @@
-from simulate_live_market import simulate_market
+"""Compatibility wrapper for market_core.simulator."""
 
+import sys
 
-if __name__ == "__main__":
-    simulate_market(interval_seconds=3)
+from market_core import simulator as _impl
+
+sys.modules[__name__] = _impl

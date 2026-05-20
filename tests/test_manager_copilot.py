@@ -103,17 +103,25 @@ class ManagerCopilotTests(unittest.TestCase):
         self.assertTrue(sold_out["sold_out"])
         self.assertTrue(sold_out["material_retention_gap"])
         self.assertEqual(sold_out["review_status"], "Review needed")
-        self.assertTrue(any("Sold-out OTB" in flag for flag in sold_out["review_flags"]))
+        self.assertTrue(any("fully booked on paper" in flag for flag in sold_out["review_flags"]))
         self.assertEqual(sold_out["raw_otb_occupancy"], 1.0)
         self.assertEqual(sold_out["adjusted_otb_occupancy"], 0.65)
         self.assertEqual(sold_out["forecasted_occupancy"], 0.82)
         self.assertEqual(sold_out["booked_adr"], 129.84)
+        self.assertEqual(sold_out["expected_cancellations"], 82.0)
+        self.assertEqual(sold_out["current_otb"], 237.0)
+        self.assertEqual(sold_out["adjusted_otb"], 154.05)
+        self.assertTrue(any("fully booked on paper" in reason for reason in sold_out["top_reasons"]))
+        self.assertTrue(any("likely retained occupancy" in flag for flag in sold_out["review_flags"]))
+        self.assertFalse(any("raw otb" in flag.lower() for flag in sold_out["review_flags"]))
 
     def test_revenue_upside_is_measured_against_booked_adr_not_reference_price(self):
         records = manager_copilot.build_opportunity_records(self._forecast_df(), self._live_data())
         second_date = next(row for row in records if row["date"] == "2017-09-02")
 
         self.assertEqual(second_date["booked_adr"], 145.0)
+        self.assertGreater(second_date["expected_rooms"], 0)
+        self.assertGreater(second_date["booked_adr_proxy_expected_rooms"], 0)
         self.assertGreater(second_date["reference_adr"], 0)
         self.assertEqual(
             second_date["revenue_upside"],
@@ -135,6 +143,59 @@ class ManagerCopilotTests(unittest.TestCase):
         self.assertIn("Focus first on", briefing)
         self.assertNotIn("optimizer", briefing.lower())
         self.assertEqual(before_prices, [row["recommended_adr"] for row in records])
+
+    def test_sanitize_executive_briefing_removes_code_marks_and_currency_spacing(self):
+        cleaned = manager_copilot.sanitize_executive_briefing("`Focus on $ 538 upside.`")
+        self.assertEqual(cleaned, "Focus on $538 upside.")
+
+    def test_market_outlook_metrics_use_room_nights_and_high_demand_regimes(self):
+        records = manager_copilot.build_opportunity_records(self._forecast_df(), self._live_data())
+        records[0]["market_regime"] = "event_compression"
+        records[1]["market_regime"] = "market_wide_sellout"
+
+        metrics = manager_copilot.build_market_outlook_metrics(records)
+
+        self.assertEqual(metrics["booked_room_nights"], 402.9)
+        self.assertEqual(metrics["retained_room_nights"], 315.21)
+        self.assertEqual(metrics["high_demand_market_dates"], 2)
+
+    def test_champion_model_audit_compares_selection_and_recent_audit(self):
+        champion_payload = {
+            "model": "random_forest_recursive",
+            "metrics": {
+                "Accuracy": 87.1504,
+                "WAPE": 12.8496,
+                "Bias": 0.0035035,
+                "Stability": 0.927529,
+            },
+            "backtest_metadata": {"audit_status": "ok"},
+        }
+        audit_summary = pd.DataFrame(
+            [
+                {
+                    "Model": "random_forest_recursive",
+                    "Accuracy": 97.0975,
+                    "WAPE": 2.9025,
+                    "Bias": -0.0137357,
+                    "Stability": 0.972786,
+                    "Interval_Coverage": 1.0,
+                    "Audit_Status": "ok",
+                    "Is_Champion": True,
+                }
+            ]
+        )
+
+        audit = manager_copilot.build_champion_model_audit(champion_payload, audit_summary)
+
+        self.assertEqual(audit["champion_model"], "random_forest_recursive")
+        self.assertEqual(audit["recent_accuracy"], 97.0975)
+        rows = {row["Metric"]: row for row in audit["rows"]}
+        self.assertEqual(rows["Forecast Accuracy"]["Selection Backtest"], "87.2%")
+        self.assertEqual(rows["Forecast Accuracy"]["Recent Audit"], "97.1%")
+        self.assertEqual(rows["Bias"]["Selection Backtest"], "+0.35 pts")
+        self.assertEqual(rows["Bias"]["Recent Audit"], "-1.37 pts")
+        self.assertEqual(rows["Interval Coverage"]["Recent Audit"], "100.0%")
+        self.assertEqual(rows["Audit Status"]["Recent Audit"], "Ok")
 
     def test_overstepping_ai_briefing_falls_back_to_bounded_copy(self):
         records = manager_copilot.build_opportunity_records(self._forecast_df(), self._live_data())
@@ -163,14 +224,53 @@ class ManagerCopilotTests(unittest.TestCase):
         self.assertIn("Focus first on", briefing)
         self.assertNotIn("raise rates", briefing.lower())
 
-    def test_today_view_source_contains_core_sections(self):
+    def test_technical_ai_briefing_falls_back_to_manager_copy(self):
+        records = manager_copilot.build_opportunity_records(self._forecast_df(), self._live_data())
+        payload = manager_copilot.build_briefing_payload(records)
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content='{"executive_briefing": "Sep 1 has $538 upside, but raw OTB sellout and retained occupancy require review."}'
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+        )
+
+        with patch.object(manager_copilot, "_resolve_api_key", return_value="test-key"), patch.object(
+            manager_copilot, "_get_client", return_value=fake_client
+        ):
+            briefing = manager_copilot.generate_executive_briefing(payload)
+
+        self.assertIn("Focus first on", briefing)
+        self.assertNotIn("raw OTB", briefing)
+
+    def test_manager_facing_views_source_contains_core_sections(self):
         app_source = (ROOT / "src" / "app.py").read_text(encoding="utf-8")
-        self.assertIn('["Today", "📈 Market Performance", "🤖 Agentic Simulation"]', app_source)
+        self.assertIn('["Morning Briefing", "Market Outlook", "Scenario Lab"]', app_source)
         self.assertIn('st.subheader("Executive Briefing")', app_source)
+        self.assertIn('c1.metric("Total Revenue Upside"', app_source)
+        self.assertIn('c3.metric("Expected Cancellations"', app_source)
         self.assertIn('st.subheader("Top Revenue Opportunities")', app_source)
         self.assertIn('st.subheader("Top Risks / Review Needed")', app_source)
         self.assertIn('st.subheader("30-Day Snapshot")', app_source)
         self.assertIn('st.subheader(f"Date Detail — {selected_date}")', app_source)
+        self.assertIn("build_revenue_upside_basis_text(selected_record)", app_source)
+        self.assertIn('st.subheader("Champion Model Audit")', app_source)
+        self.assertIn('if st.sidebar.button("Run Scenario"', app_source)
+        self.assertIn('render_technical_trace(agent_result)', app_source)
+        self.assertIn('"Likely Retained": format_pct', app_source)
+        self.assertIn('"Booked Rooms": f"', app_source)
+        self.assertIn('"Recommended ADR": f"', app_source)
+        self.assertIn('"Stayover Rooms"', app_source)
+        self.assertIn('"Future Arrival Rooms"', app_source)
+        self.assertIn("in-house stayovers are treated as retained", app_source)
 
 
 if __name__ == "__main__":

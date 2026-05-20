@@ -16,6 +16,14 @@ def normalize_reasoning(text):
     
     return text.strip()
 
+
+def escape_streamlit_markdown(text):
+    if not text:
+        return ""
+    # Streamlit renders Markdown inside alert boxes. Escape currency markers so
+    # amounts like $538 do not get interpreted as inline math.
+    return str(text).replace("$", r"\$")
+
 def load_prompt(file_path, **kwargs):
     with open(file_path, 'r') as f:
         template = f.read()

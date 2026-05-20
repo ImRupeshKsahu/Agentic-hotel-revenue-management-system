@@ -11,6 +11,7 @@ import pricing_agent
 from config import BASE_PRICE
 from local_intel_estimator import estimate_local_intel_impact
 from pricing_engine import calculate_recommended_price
+from utils.utility_functions import escape_streamlit_markdown
 
 
 class FakeCompletions:
@@ -123,12 +124,12 @@ class ExplainablePricingTests(unittest.TestCase):
             [row["Signal"] for row in result["decision_context_components"]],
             [
                 "Current booked occupancy",
-                "Retained OTB after cancellations",
-                "Gross booked pace",
+                "Likely retained occupancy",
+                "Booked pace",
                 "Recent pickup trend",
-                "Demand anchor",
-                "Competitor signal",
-                "Market premium headroom",
+                "Demand used for pricing",
+                "Competitor median",
+                "Allowed premium vs market",
                 "AI advisory",
             ],
         )
@@ -136,8 +137,17 @@ class ExplainablePricingTests(unittest.TestCase):
     def test_streamlit_metric_frames_reference_as_comparison(self):
         app_source = (ROOT / "src" / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('c3.metric("ADR vs Reference"', app_source)
-        self.assertNotIn('c3.metric("Reference Delta"', app_source)
+        self.assertIn('metric("ADR vs Reference"', app_source)
+        self.assertNotIn('metric("Reference Delta"', app_source)
+
+    def test_streamlit_currency_is_escaped_before_markdown_rendering(self):
+        self.assertEqual(escape_streamlit_markdown("Upside: $538"), r"Upside: \$538")
+
+    def test_manager_copy_surfaces_use_markdown_safe_rendering(self):
+        app_source = (ROOT / "src" / "app.py").read_text(encoding="utf-8")
+        self.assertEqual(app_source.count("escape_streamlit_markdown(normalize_reasoning("), 3)
+        self.assertIn("Current booked rooms:", app_source)
+        self.assertIn("Comp set (low / median / high):", app_source)
 
     def test_missing_ai_key_keeps_optimizer_price_with_clean_advisory(self):
         self._original_resolve_api_key = pricing_agent._resolve_api_key
@@ -379,8 +389,8 @@ class ExplainablePricingTests(unittest.TestCase):
         )
 
         self.assertIn("currently 100.0% booked", summary)
-        self.assertIn("retained OTB is 65.0%", summary)
-        self.assertIn("forecast is 93.2%", summary)
+        self.assertIn("likely retained occupancy is 65.0%", summary)
+        self.assertIn("forecast occupancy is 93.2%", summary)
         self.assertNotIn("already 93.2% booked", summary)
 
     def test_sep_1_regression_uses_sold_out_floor_and_clear_summary(self):
@@ -414,8 +424,8 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertTrue(result["optimizer_diagnostics"]["sold_out"])
         self.assertTrue(result["optimizer_diagnostics"]["sold_out_floor_applied"])
         self.assertIn("currently 100.0% booked", result["strategic_reasoning"])
-        self.assertIn("retained OTB is 65.0%", result["strategic_reasoning"])
-        self.assertIn("forecast is 93.2%", result["strategic_reasoning"])
+        self.assertIn("likely retained occupancy is 65.0%", result["strategic_reasoning"])
+        self.assertIn("forecast occupancy is 93.2%", result["strategic_reasoning"])
 
 
 if __name__ == "__main__":

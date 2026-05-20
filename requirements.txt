@@ -12,6 +12,7 @@ python-dotenv>=1.0
 scikit-learn>=1.7
 xgboost>=3.2
 statsmodels>=0.14.6
+boruta>=0.4.3
 
 # Agentic pricing and LLM calls
 openai>=1.10

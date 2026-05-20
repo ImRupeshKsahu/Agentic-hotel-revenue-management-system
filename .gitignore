@@ -40,6 +40,9 @@ data/plots/
 data/*_output.csv
 data/*metrics*.csv
 data/backtest_*.csv
+data/backtest_run_latest.log
+data/boruta_selection_report.csv
+data/feature_manifest.csv
 data/forecast_champion.json
 data/live_market_state.json
 data/live_competitor_market.csv

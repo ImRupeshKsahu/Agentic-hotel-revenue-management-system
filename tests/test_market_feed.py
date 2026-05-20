@@ -89,6 +89,7 @@ class MarketFeedTests(unittest.TestCase):
         state = export_live_market_state(otb, market_snapshots=market)
         day = state["2026-06-01"]
 
+        self.assertEqual(day["booked_adr"], 120.0)
         self.assertEqual(day["competitor_price"], 135.0)
         self.assertEqual(day["comp_low"], 120.0)
         self.assertEqual(day["comp_high"], 150.0)

@@ -5,19 +5,32 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import timedelta
-from plotly.subplots import make_subplots
-from config import BASE_PRICE,BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_COMPETITOR_MARKET_PATH, LIVE_MARKET_STATE_PATH, MODEL_COMPARISON_PATH, OTB_SNAPSHOT_PATH
-from pricing_engine import calculate_recommended_price
-from pricing_agent import run_agentic_pricing
-from local_intel_estimator import estimate_local_intel_impact
-from manager_copilot import (
+from config import (
+    BACKTEST_AUDIT_SUMMARY_PATH,
+    BASE_PRICE,
+    BASE_CAPACITY,
+    DATA_END_DATE,
+    FORECAST_CHAMPION_PATH,
+    FORECAST_OUTPUT_PATH,
+    LIVE_COMPETITOR_MARKET_PATH,
+    LIVE_MARKET_STATE_PATH,
+    MODEL_COMPARISON_PATH,
+    OTB_SNAPSHOT_PATH,
+)
+from pricing_core.engine import calculate_recommended_price
+from copilot_core.pricing_agent import run_agentic_pricing
+from pricing_core.local_intel import estimate_local_intel_impact
+from copilot_core.manager import (
     build_briefing_payload,
+    build_champion_model_audit,
+    build_market_outlook_metrics,
     build_opportunity_records,
+    build_summary_metrics,
     generate_executive_briefing,
     rank_top_opportunities,
     rank_top_risks,
 )
-from utils.utility_functions import normalize_reasoning
+from utils.utility_functions import escape_streamlit_markdown, normalize_reasoning
 
 # --- PATH SETUP ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -53,24 +66,54 @@ def load_model_metrics_cached(path, mtime):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def load_audit_summary_cached(path, mtime):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_champion_payload_cached(path, mtime):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_live_market_state_cached(json_path, otb_path, forecast_path, market_path, json_mtime, otb_mtime, forecast_mtime, market_mtime):
     if os.path.exists(json_path):
         with open(json_path, "r") as f:
             cached_state = json.load(f)
         if cached_state and all("adjusted_otb_occupancy" in entry for entry in cached_state.values()):
-            for entry in cached_state.values():
+            booked_adr_by_date = {}
+            if os.path.exists(otb_path):
+                otb_adr_df = pd.read_csv(otb_path, usecols=["Date", "OTB_ADR"])
+                otb_adr_df["Date"] = pd.to_datetime(otb_adr_df["Date"])
+                booked_adr_by_date = {
+                    row.Date.strftime("%Y-%m-%d"): float(row.OTB_ADR)
+                    for row in otb_adr_df.itertuples(index=False)
+                    if pd.notna(row.OTB_ADR)
+                }
+            for date_key, entry in cached_state.items():
                 total_rooms = float(entry.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY)
                 entry.setdefault(
                     "raw_otb_occupancy",
                     float(entry.get("current_otb", 0)) / total_rooms,
                 )
+                entry.setdefault("stayover_otb", 0)
+                entry.setdefault("future_arrival_otb", entry.get("current_otb", 0))
                 entry.setdefault("comp_low", entry.get("competitor_price"))
                 entry.setdefault("comp_median", entry.get("competitor_price"))
                 entry.setdefault("comp_high", entry.get("competitor_price"))
                 entry.setdefault("sample_size", 1)
                 entry.setdefault("source_quality", "legacy_single_rate")
                 entry.setdefault("market_regime", "legacy_single_rate")
-                entry.setdefault("booked_adr", entry.get("otb_adr", entry.get("competitor_price")))
+                if entry.get("booked_adr") is None:
+                    if date_key in booked_adr_by_date:
+                        entry["booked_adr"] = booked_adr_by_date[date_key]
+                    elif entry.get("otb_adr") is not None:
+                        entry["booked_adr"] = entry["otb_adr"]
                 legacy_velocity = float(entry.get("booking_velocity", 1.0))
                 entry.setdefault("gross_pace_index", legacy_velocity)
                 entry.setdefault("retained_pace_index", legacy_velocity)
@@ -140,6 +183,8 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
         state[pd.to_datetime(row.Date).strftime("%Y-%m-%d")] = {
             "current_otb": int(getattr(row, "Live_OTB", 0)),
             "raw_otb_occupancy": float(getattr(row, "Live_OTB", 0)) / max(getattr(row, "Capacity", BASE_CAPACITY), 1),
+            "stayover_otb": int(getattr(row, "Stayover_OTB", 0)),
+            "future_arrival_otb": int(getattr(row, "Future_Arrival_OTB", getattr(row, "Live_OTB", 0))),
             "adjusted_otb": float(getattr(row, "Adjusted_OTB", getattr(row, "Live_OTB", 0))),
             "expected_cancellations": float(getattr(row, "Expected_Cancellations", 0.0)),
             "adjusted_otb_occupancy": float(
@@ -191,6 +236,14 @@ def load_model_metrics():
     return load_model_metrics_cached(MODEL_COMPARISON_PATH, file_mtime(MODEL_COMPARISON_PATH))
 
 
+def load_audit_summary():
+    return load_audit_summary_cached(BACKTEST_AUDIT_SUMMARY_PATH, file_mtime(BACKTEST_AUDIT_SUMMARY_PATH))
+
+
+def load_champion_payload():
+    return load_champion_payload_cached(FORECAST_CHAMPION_PATH, file_mtime(FORECAST_CHAMPION_PATH))
+
+
 def adjusted_otb_occupancy(live_entry):
     total_rooms = float(live_entry.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY)
     if live_entry.get("adjusted_otb_occupancy") is not None:
@@ -208,13 +261,24 @@ def format_pct(value):
     return f"{float(value) * 100:.1f}%"
 
 
+def build_revenue_upside_basis_text(record):
+    return (
+        f"Upside basis: recommended ADR ${record['recommended_adr']:.2f} × "
+        f"{record['expected_rooms']:.2f} expected rooms = ${record['expected_revenue']:,.2f}; "
+        f"booked ADR ${record['booked_adr']:.2f} maps to nearest optimizer candidate "
+        f"${record['booked_adr_proxy_price']:.2f} × {record['booked_adr_proxy_expected_rooms']:.2f} "
+        f"expected rooms = ${record['booked_adr_revenue_proxy']:,.2f}."
+    )
+
+
 def build_today_snapshot_rows(records):
     return [
         {
             "Date": row["date"],
             "ADR": f"${row['recommended_adr']:.2f}",
             "Booked": format_pct(row["raw_otb_occupancy"]),
-            "Retained OTB": format_pct(row["adjusted_otb_occupancy"]),
+            "Expected Cancellations": f"{row['expected_cancellations']:.2f}",
+            "Likely Retained": format_pct(row["adjusted_otb_occupancy"]),
             "Forecast": format_pct(row["forecasted_occupancy"]),
             "Pickup": f"{row['pickup_trend_index']:.2f}x",
             "Comp Median": f"${row['competitor_median']:.2f}",
@@ -239,7 +303,7 @@ def build_manager_table_rows(records):
     ]
 
 
-BRIEFING_POLICY_VERSION = 3
+BRIEFING_POLICY_VERSION = 4
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -274,25 +338,206 @@ def render_price_trace(agent_result):
         st.subheader("Guardrail Audit")
         st.dataframe(pd.DataFrame(guardrail_rows), use_container_width=True, hide_index=True)
 
+
+def render_technical_trace(agent_result):
+    with st.expander("Show Technical Trace"):
+        st.write(f"**Applied Logic Flags:** {agent_result.get('logic_flags', [])}")
+        st.write(f"**Forecasted Occupancy:** {agent_result.get('forecasted_occupancy', 0) * 100:.1f}%")
+        st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
+        st.write(f"**Market Context:** {agent_result.get('market_context', {})}")
+        st.write(f"**Sold-Out Compression:** {agent_result.get('optimizer_diagnostics', {}).get('sold_out', False)}")
+        st.write(f"**AI Recommended Action:** {agent_result.get('ai_recommended_action', 'n/a')}")
+        st.write(f"**AI Risk Level:** {agent_result.get('ai_risk_level', 'n/a')}")
+        st.write(f"**AI Review Flags:** {agent_result.get('ai_review_flags', [])}")
+        st.write(f"**Local Intel Estimate:** {agent_result.get('local_intel_estimate', {})}")
+        st.write(f"**Manual Demand Adjustment:** {agent_result.get('manual_demand_shock', 0) * 100:+.1f}%")
+        st.write(f"**Local Intel Applied Adjustment:** {agent_result.get('local_intel_applied_shock', 0) * 100:+.1f}%")
+        st.write(f"**Total Optimizer Demand Shock:** {agent_result.get('total_demand_shock', 0) * 100:+.1f}%")
+        st.write(f"**Guardrails Applied:** {agent_result.get('guardrails_applied', [])}")
+        st.write(f"**Manual Approval Required:** {agent_result.get('manual_approval_required', False)}")
+
+
+def build_booking_quality_plot_df(records):
+    rows = []
+    for row in records:
+        total_rooms = max(float(row.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY), 1.0)
+        rows.append(
+            {
+                "Date": pd.to_datetime(row["date"]),
+                "Booked Rooms": float(row.get("current_otb", 0.0)),
+                "Stayover Rooms": float(row.get("stayover_otb", 0.0)),
+                "Future Arrival Rooms": float(row.get("future_arrival_otb", row.get("current_otb", 0.0))),
+                "Likely Retained Rooms": float(row.get("adjusted_otb", 0.0)),
+                "Forecast Rooms": min(round(float(row.get("forecasted_occupancy", 0.0)) * total_rooms), total_rooms),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_booking_quality_trend(records):
+    plot_df = build_booking_quality_plot_df(records)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Booked Rooms"],
+            name="Booked Rooms",
+            line=dict(color="#2563EB", width=3),
+            customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
+            hovertemplate=(
+                "Booked Rooms: %{y:.2f}<br>"
+                "Stayover Rooms: %{customdata[0]:.2f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Likely Retained Rooms"],
+            name="Likely Retained Rooms",
+            line=dict(color="#0F766E", width=3),
+            customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
+            hovertemplate=(
+                "Likely Retained Rooms: %{y:.2f}<br>"
+                "Stayover Rooms: %{customdata[0]:.2f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Forecast Rooms"],
+            name="Forecast Rooms",
+            line=dict(color="#F59E0B", width=3, dash="dot"),
+            customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
+            hovertemplate=(
+                "Forecast Rooms: %{y:.2f}<br>"
+                "Stayover Rooms: %{customdata[0]:.2f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title="30-Day Booking Quality",
+        hovermode="x unified",
+        yaxis_title="Room Nights",
+        legend_title="",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_selected_booking_quality(record):
+    values = [
+        float(record.get("current_otb", 0.0)),
+        float(record.get("expected_cancellations", 0.0)),
+        float(record.get("adjusted_otb", 0.0)),
+    ]
+    fig = go.Figure(
+        go.Bar(
+            x=["Current Booked", "Expected Cancellations", "Likely Retained"],
+            y=values,
+            marker_color=["#2563EB", "#DC2626", "#0F766E"],
+            text=[f"{value:.2f}" for value in values],
+            textposition="outside",
+        )
+    )
+    fig.update_layout(
+        title="Selected-Date Booking Quality",
+        yaxis_title="Rooms",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Cancellation risk is estimated only for not-yet-arrived bookings using remaining days to arrival, lead time, "
+        "segment, channel, and customer type; in-house stayovers are treated as retained."
+    )
+
+
+def render_pricing_vs_market_chart(records):
+    plot_df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime([row["date"] for row in records]),
+            "Recommended ADR": [row["recommended_adr"] for row in records],
+            "Comp Low": [row["comp_low"] for row in records],
+            "Comp Median": [row["competitor_median"] for row in records],
+            "Comp High": [row["comp_high"] for row in records],
+        }
+    )
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Comp High"],
+            line=dict(width=0),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Comp Low"],
+            fill="tonexty",
+            fillcolor="rgba(148, 163, 184, 0.22)",
+            line=dict(width=0),
+            name="Comp Range",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Comp Median"],
+            name="Comp Median",
+            line=dict(color="#64748B", width=2, dash="dot"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["Date"],
+            y=plot_df["Recommended ADR"],
+            name="Recommended ADR",
+            line=dict(color="#DB2777", width=3),
+        )
+    )
+    fig.update_layout(
+        title="Pricing vs Market",
+        hovermode="x unified",
+        yaxis_title="ADR ($)",
+        legend_title="",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 # 4. Sidebar Navigation
 st.sidebar.header("🕹️ System Controls")
-app_mode = st.sidebar.radio("Switch View", ["Today", "📈 Market Performance", "🤖 Agentic Simulation"])
+app_mode = st.sidebar.radio("Switch View", ["Morning Briefing", "Market Outlook", "Scenario Lab"])
 forecast_df = load_forecast_output_cached(FORECAST_OUTPUT_PATH, file_mtime(FORECAST_OUTPUT_PATH))
 
 # ==========================================
-# PAGE 1: TODAY (Manager Copilot)
+# PAGE 1: MORNING BRIEFING
 # ==========================================
-if app_mode == "Today":
-    st.subheader("Today")
+if app_mode == "Morning Briefing":
+    st.subheader("Morning Briefing")
+    st.caption(f"Demo as-of date: {DATA_END_DATE.strftime('%Y-%m-%d')}")
     live_data = load_live_market_data()
     opportunity_records = build_opportunity_records(forecast_df, live_data)
     top_opportunities = rank_top_opportunities(opportunity_records)
     top_risks = rank_top_risks(opportunity_records)
+    summary_metrics = build_summary_metrics(opportunity_records)
     briefing_payload = build_briefing_payload(opportunity_records)
     briefing = executive_briefing_cached(json.dumps(briefing_payload, sort_keys=True), BRIEFING_POLICY_VERSION)
 
     st.subheader("Executive Briefing")
-    st.info(normalize_reasoning(briefing))
+    st.info(escape_streamlit_markdown(normalize_reasoning(briefing)))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Revenue Upside", f"${summary_metrics['total_revenue_upside']:,.0f}")
+    c2.metric("Dates With Upside", summary_metrics["dates_with_upside"])
+    c3.metric("Dates Needing Review", summary_metrics["dates_needing_review"])
+    c4.metric("Sold-Out Dates", summary_metrics["sold_out_dates"])
+
+    render_booking_quality_trend(opportunity_records)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -368,48 +613,52 @@ if app_mode == "Today":
     )
 
     st.subheader(f"Date Detail — {selected_date}")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Recommended ADR", f"${selected_record['recommended_adr']:.2f}")
     c2.metric("Current Booked", format_pct(selected_record["raw_otb_occupancy"]))
-    c3.metric("Retained OTB", format_pct(selected_record["adjusted_otb_occupancy"]))
-    c4.metric("Forecast Occupancy", format_pct(selected_record["forecasted_occupancy"]))
+    c3.metric("Expected Cancellations", f"{selected_record['expected_cancellations']:.2f}")
+    c4.metric("Likely Retained", format_pct(selected_record["adjusted_otb_occupancy"]))
+    c5.metric("Forecast Occupancy", format_pct(selected_record["forecasted_occupancy"]))
     st.caption(
-        f"Competitor median: ${selected_record['competitor_median']:.2f} | "
-        f"Booked ADR: ${selected_record['booked_adr']:.2f} | "
-        f"Upside vs booked ADR: ${selected_record['revenue_upside']:,.0f} | "
-        f"Review status: {selected_record['review_status']}"
+        escape_streamlit_markdown(
+            f"Competitor median: ${selected_record['competitor_median']:.2f} | "
+            f"Booked ADR: ${selected_record['booked_adr']:.2f} | "
+            f"Upside vs booked ADR: ${selected_record['revenue_upside']:,.0f} | "
+            f"Review status: {selected_record['review_status']} | "
+            f"Stayovers: {selected_record.get('stayover_otb', 0):.0f} | "
+            f"Future arrivals: {selected_record.get('future_arrival_otb', selected_record['current_otb']):.0f}"
+        )
     )
-    st.info(normalize_reasoning(agent_result["strategic_reasoning"]))
+    st.caption(escape_streamlit_markdown(build_revenue_upside_basis_text(selected_record)))
+    render_selected_booking_quality(selected_record)
+    st.info(escape_streamlit_markdown(normalize_reasoning(agent_result["strategic_reasoning"])))
+    render_technical_trace(agent_result)
     render_price_trace(agent_result)
 
 # ==========================================
-# PAGE 2: MARKET PERFORMANCE (Live Status)
+# PAGE 2: MARKET OUTLOOK
 # ==========================================
-elif app_mode == "📈 Market Performance":
-    st.subheader("Real-Time Market & Baseline Strategy")
-    
+elif app_mode == "Market Outlook":
+    st.subheader("Market Outlook")
+    st.caption(f"Demo as-of date: {DATA_END_DATE.strftime('%Y-%m-%d')}")
+     
     live_data = load_live_market_data()
     metrics_df = load_model_metrics()
+    audit_summary_df = load_audit_summary()
+    champion_payload = load_champion_payload()
+    opportunity_records = build_opportunity_records(forecast_df, live_data)
+    outlook_metrics = build_market_outlook_metrics(opportunity_records)
+    champion_audit = build_champion_model_audit(champion_payload, audit_summary_df)
 
     c1, c2, c3, c4 = st.columns(4)
-    total_otb = sum(v.get("current_otb", 0) for v in live_data.values())
-    c1.metric("Demo As-Of Date", DATA_END_DATE.strftime("%Y-%m-%d"))
-    c2.metric("30-Day OTB Rooms", f"{total_otb:,}")
-    if not metrics_df.empty:
-        best = metrics_df.sort_values(["WAPE", "RMSE"]).iloc[0]
-        if "Horizon" in best.index:
-            best_label = f"{humanize_label(best['Model'])} / {int(best['Horizon'])}d"
-        elif "Strategy" in best.index:
-            best_label = humanize_label(best["Model"])
-        else:
-            best_label = humanize_label(best["Model"])
-        c3.metric("Best Model", best_label)
-        if "Strategy" in best.index:
-            c3.caption(f"Strategy: {humanize_label(best['Strategy'])}")
-        c4.metric("Backtest WAPE", f"{best['WAPE']:.1f}%")
-    else:
-        c3.metric("Best Model", "Run forecast")
-        c4.metric("Backtest WAPE", "n/a")
+    recent_accuracy = champion_audit["recent_accuracy"]
+    c1.metric("30-Day Booked Room Nights", f"{outlook_metrics['booked_room_nights']:,.0f}")
+    c2.metric("Likely Retained Room Nights", f"{outlook_metrics['retained_room_nights']:,.0f}")
+    c3.metric("Recent Forecast Accuracy", "n/a" if pd.isna(recent_accuracy) else f"{recent_accuracy:.1f}%")
+    c4.metric("High-Demand Market Dates", outlook_metrics["high_demand_market_dates"])
+
+    render_booking_quality_trend(opportunity_records)
+    render_pricing_vs_market_chart(opportunity_records)
 
     # Inject Live Data into the Forecast Dataframe for the table
     live_records = []
@@ -443,58 +692,34 @@ elif app_mode == "📈 Market Performance":
         live_records.append({
             "Date": d_str,
             "Day": row['Date'].strftime('%A'),
-            "Live_OTB": f"{live_entry.get('current_otb', 0)}",
-            "OTB_Occupancy": f"{live_entry.get('current_otb', 0)/BASE_CAPACITY:.1%}",
-            "Forecasted_occupancy":f"{min(round(row['Forecasted_Occupancy']*BASE_CAPACITY),237)}",
-            "Comp_Price": f"${live_entry.get('competitor_price', 0):.2f}",
-            "Recommended_Price": f"${price:.2f}",
-            "Booked_Pace": f"{live_entry.get('gross_pace_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
-            "Recent_Pickup": f"{live_entry.get('pickup_trend_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
-            "System_Status": live_entry.get('status', 'Normal')
+            "Booked Rooms": f"{live_entry.get('current_otb', 0)}",
+            "Booked Occupancy": f"{live_entry.get('current_otb', 0)/BASE_CAPACITY:.1%}",
+            "Forecast Rooms": f"{min(round(row['Forecasted_Occupancy']*BASE_CAPACITY),237)}",
+            "Comp Median": f"${live_entry.get('competitor_price', 0):.2f}",
+            "Recommended ADR": f"${price:.2f}",
+            "Booked Pace": f"{live_entry.get('gross_pace_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
+            "Recent Pickup": f"{live_entry.get('pickup_trend_index', live_entry.get('booking_velocity', 1.0)):.2f}x",
+            "Status": live_entry.get('status', 'Normal')
         })
 
-    # Plotting
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    plot_df = pd.DataFrame(live_records)
-    plot_df['Date'] = pd.to_datetime(plot_df['Date'])
-    
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Live_OTB'].astype(float), 
-                             name="Live Occupancy", line=dict(color='#3B82F6', width=3)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df["Forecasted_occupancy"].astype(float), 
-                             name="Forecasted Occupancy", line=dict(color="#11F333", width=3)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Recommended_Price'].str.lstrip('$').astype(float), 
-                             name="Recommended Price ($)", line=dict(color="#F30C9A", width=3)), secondary_y=True)
-
-    fig.update_layout(title="Live Market Snapshot", hovermode="x unified")
-    # Left Axis: Number of Rooms
-    fig.update_yaxes(
-        title_text="<b>Inventory (No. of Rooms)</b>", 
-        secondary_y=False,
-        gridcolor='LightGray'
-    )
-
-    # Right Axis: Price in $
-    fig.update_yaxes(
-        title_text="<b>Price ($)</b>", 
-        secondary_y=True,
-        tickprefix="$", 
-        showgrid=False # Keep it clean by only showing one set of gridlines
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
     # Strategy Table
-    st.subheader("📅 Live 30-Day Strategy Feed")
+    st.subheader("30-Day Strategy Feed")
     st.dataframe(pd.DataFrame(live_records), use_container_width=True, height=400, hide_index=True)
 
-    if not metrics_df.empty:
-        st.subheader("Forecast Model Backtesting")
-        st.dataframe(metrics_df, use_container_width=True, height=260, hide_index=True)
+    st.subheader("Champion Model Audit")
+    st.caption(f"Champion: {humanize_label(champion_audit['champion_model'])}")
+    st.dataframe(pd.DataFrame(champion_audit["rows"]), use_container_width=True, hide_index=True)
+    with st.expander("Show full model comparison"):
+        if not metrics_df.empty:
+            st.dataframe(metrics_df, use_container_width=True, height=260, hide_index=True)
+        else:
+            st.info("Run forecast backtesting to populate model comparison metrics.")
 
 # ==========================================
-# PAGE 2: AGENTIC SIMULATION (The "Thinking" View)
+# PAGE 3: SCENARIO LAB
 # ==========================================
 else:
-    st.subheader("🤖 Agentic Pricing Simulation")
+    st.subheader("Scenario Lab")
     
     # Sidebar Sliders
     st.sidebar.divider()
@@ -526,10 +751,13 @@ else:
     )
 
     st.sidebar.info(
-        f"Current Live OTB: {current_state['current_otb']} | "
-        f"Comp Set: ${current_state.get('comp_low', current_state['competitor_price']):.2f}"
-        f" / ${current_state.get('comp_median', current_state['competitor_price']):.2f}"
-        f" / ${current_state.get('comp_high', current_state['competitor_price']):.2f}"
+        escape_streamlit_markdown(
+            f"Current booked rooms: {current_state['current_otb']} | "
+            f"Comp set (low / median / high): "
+            f"${current_state.get('comp_low', current_state['competitor_price']):.2f}"
+            f" / ${current_state.get('comp_median', current_state['competitor_price']):.2f}"
+            f" / ${current_state.get('comp_high', current_state['competitor_price']):.2f}"
+        )
     )
     st.sidebar.caption(
         f"Market regime: {current_state.get('market_regime', 'n/a').replace('_', ' ').title()} | "
@@ -581,7 +809,7 @@ else:
     total_baseline_shock = demand_shock + local_intel_applied_shock
     st.sidebar.caption(f"Total demand shock included in optimizer: {total_baseline_shock * 100:+.1f}%")
 
-    if st.sidebar.button("Execute Agentic Decision", type="primary"):
+    if st.sidebar.button("Run Scenario", type="primary"):
         market_context = {
             "comp_low": override_low if override_market else current_state.get("comp_low"),
             "comp_median": override_median if override_market else current_state.get("comp_median"),
@@ -626,12 +854,11 @@ else:
         log_placeholder.empty()
         
         # Dashboard Metrics
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Final ADR", f"${agent_result['final_adr']:.2f}")
-        c2.metric("Optimizer ADR", f"${agent_result.get('optimized_price', agent_result['rule_based_price']):.2f}")
-        c3.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
-        c4.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
-        c5.metric("Pricing Pace", f"{agent_result['pricing_pace_index']}x")
+        c2.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
+        c3.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
+        c4.metric("Pricing Pace", f"{agent_result['pricing_pace_index']}x")
 
         st.markdown("---")
         
@@ -647,22 +874,12 @@ else:
         else:
             st.warning(banner_text)
         # st.success(agent_result['strategic_reasoning'])
-        st.info(normalize_reasoning(agent_result['strategic_reasoning']))
-        # Detailed Trace Expander
-        with st.expander("Show Technical Node Trace"):
-            st.write(f"**Applied Logic Flags:** {agent_result['logic_flags']}")
-            st.write(f"**Forecasted Occupancy:** {agent_result['forecasted_occupancy']*100}%")
-            st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
-            st.write(f"**Market Context:** {agent_result.get('market_context', {})}")
-            st.write(f"**Sold-Out Compression:** {agent_result.get('optimizer_diagnostics', {}).get('sold_out', False)}")
-            st.write(f"**AI Recommended Action:** {agent_result.get('ai_recommended_action', 'n/a')}")
-            st.write(f"**AI Risk Level:** {agent_result.get('ai_risk_level', 'n/a')}")
-            st.write(f"**AI Review Flags:** {agent_result.get('ai_review_flags', [])}")
-            st.write(f"**Local Intel Estimate:** {agent_result.get('local_intel_estimate', {})}")
-            st.write(f"**Manual Demand Adjustment:** {agent_result.get('manual_demand_shock', 0) * 100:+.1f}%")
-            st.write(f"**Local Intel Applied Adjustment:** {agent_result.get('local_intel_applied_shock', 0) * 100:+.1f}%")
-            st.write(f"**Total Optimizer Demand Shock:** {agent_result.get('total_demand_shock', 0) * 100:+.1f}%")
-            st.write(f"**Guardrails Applied:** {agent_result.get('guardrails_applied', [])}")
-            st.write(f"**Manual Approval Required:** {agent_result.get('manual_approval_required', False)}")
-
+        st.info(escape_streamlit_markdown(normalize_reasoning(agent_result['strategic_reasoning'])))
+        scenario_record = {
+            "current_otb": float(current_state.get("current_otb", 0.0)),
+            "expected_cancellations": float(current_state.get("expected_cancellations", 0.0)),
+            "adjusted_otb": float(current_state.get("adjusted_otb", current_state.get("current_otb", 0.0))),
+        }
+        render_selected_booking_quality(scenario_record)
+        render_technical_trace(agent_result)
         render_price_trace(agent_result)

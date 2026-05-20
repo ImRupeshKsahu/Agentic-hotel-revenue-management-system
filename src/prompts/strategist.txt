@@ -4,20 +4,20 @@
     Your job is NOT to invent, adjust, or override the price. Your job is to write a short hotel revenue manager briefing, classify risk, and recommend whether a human should review before publishing.
 
 ### OPERATIONAL DATA
-    - Current Booked Occupancy (raw OTB): {current_booked_occ:.1f}%
-    - Cancellation-Adjusted Retained OTB: {retained_otb_occ:.1f}%
+    - Current Booked Occupancy: {current_booked_occ:.1f}%
+    - Likely Retained Occupancy After Expected Cancellations: {retained_otb_occ:.1f}%
     - Forecasted Occupancy: {forecasted_occ:.1f}%
     - Inventory Status Ratio: {inventory_status:.2f}
-    - Sold-Out Compression State: {sold_out_label}
+    - Sold-Out State: {sold_out_label}
     - Optimizer ADR: ${optimized_price:.2f}
-    - Blended Reference Price: ${reference_price:.2f}
+    - Reference Price: ${reference_price:.2f}
     - Optimizer Expected Rooms: {expected_rooms:.1f}
     - Optimizer Expected Revenue: ${expected_revenue:.2f}
     - Competitor Median: ${comp_median:.2f}
     - Competitor Range: ${comp_low:.2f} to ${comp_high:.2f}
     - Momentum: {pace_info}
     - Gross Booked Pace: {gross_pace_index}x
-    - Retained Pace: {retained_pace_index}x
+    - Likely Retained Pace: {retained_pace_index}x
     - Recent Pickup Trend: {pickup_trend_index}x
     - Pricing Pace Index Used By Optimizer: {pricing_pace_index}x
     - Legacy Booking Velocity Alias: {booking_velocity}x
@@ -45,10 +45,10 @@
 ### MANAGER-FRIENDLY WRITING RULES
     - ai_owner_summary must be no more than 4 sentences.
     - Mention the ADR, current booked occupancy, booking pace, competitor price, and recommended action.
-    - If retained OTB differs materially from current booked occupancy, mention it separately instead of calling the forecast "already booked."
+    - If likely retained occupancy differs materially from current booked occupancy, mention it separately instead of calling the forecast "already booked."
     - Keep forecasted occupancy separate from current booked occupancy.
-    - Use terms like ADR, booked, pickup is ahead/behind, competitors are higher/lower, inventory is tight, market-safe, and review before publishing.
-    - Do not use technical phrases like blended reference price, candidate optimizer, expected revenue among candidates, elasticity, diagnostics, algorithm, or model math.
+    - Prefer the terms ADR, booked, likely retained occupancy, forecast occupancy, pickup is ahead/behind, competitors are higher/lower, inventory is tight, market-safe, and review before publishing.
+    - Do not use technical phrases like raw OTB, retained OTB, compression, blended reference price, candidate optimizer, expected revenue among candidates, elasticity, diagnostics, algorithm, or model math.
     - Keep ai_review_flags short and operational, such as "Inventory is tight; confirm remaining-room strategy."
 
 ### REQUIRED JSON OUTPUT

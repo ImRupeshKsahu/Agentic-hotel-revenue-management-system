@@ -27,6 +27,8 @@ BACKTEST_AUDIT_FOLD_METRICS_PATH = os.path.join(BASE_DIR, "data", "backtest_audi
 BACKTEST_AUDIT_SUMMARY_PATH = os.path.join(BASE_DIR, "data", "backtest_audit_summary.csv")
 BACKTEST_AUDIT_LAG_METRICS_PATH = os.path.join(BASE_DIR, "data", "backtest_audit_lag_metrics.csv")
 BACKTEST_AUDIT_INTERVAL_COVERAGE_PATH = os.path.join(BASE_DIR, "data", "backtest_audit_interval_coverage.csv")
+FEATURE_MANIFEST_PATH = os.path.join(BASE_DIR, "data", "feature_manifest.csv")
+BORUTA_SELECTION_REPORT_PATH = os.path.join(BASE_DIR, "data", "boruta_selection_report.csv")
 FORECAST_CHAMPION_PATH = os.path.join(BASE_DIR, "data", "forecast_champion.json")
 PLOTS_DIR = os.path.join(BASE_DIR, "data", "plots")
 BACKTEST_TIMELINE_PATH = os.path.join(BASE_DIR, "docs", "backtest_timeline_explainer.png")
@@ -54,3 +56,67 @@ BACKTEST_CADENCE_DAYS = 7
 STRATEGIST_PROMPT_PATH = os.path.join(BASE_DIR,"src", "prompts", "strategist.txt")
 NEW_DATA_PATH = os.path.join(BASE_DIR, "data", "hotel_bookings.csv")
 LIVE_DATA_PATH = os.path.join(BASE_DIR, "data", "live_hotel_bookings.csv")
+
+# Forecast feature engineering definitions.
+# Keep the feature contract here so feature additions/removals are reviewable without
+# digging through model code.
+FORECAST_BASELINE_LAGS = [1, 2, 3, 7, 14, 21, 28, 56]
+FORECAST_ENHANCED_EXTRA_LAGS = [4, 5, 6, 35, 42, 84, 112, 364]
+FORECAST_ROLLING_WINDOWS = [7, 14, 28, 56]
+FORECAST_BASELINE_ROLLING_STATS = ["mean", "std"]
+FORECAST_ENHANCED_ROLLING_STATS = ["min", "max", "slope"]
+FORECAST_BASELINE_TREND_FEATURES = {
+    "trend_7": ("roll_mean_7", "roll_mean_28"),
+    "trend_14": ("roll_mean_14", "roll_mean_56"),
+}
+FORECAST_TREND_PROJECTION_FEATURES = {
+    "trend_projection_7_from_14": ("roll_mean_14", "roll_slope_14", 7),
+    "trend_projection_14_from_28": ("roll_mean_28", "roll_slope_28", 14),
+    "trend_projection_30_from_56": ("roll_mean_56", "roll_slope_56", 30),
+}
+FORECAST_RECENT_EXTREME_WINDOW = 28
+FORECAST_RECENT_OPERATIONAL_WINDOW = 14
+FORECAST_ORIGIN_CALENDAR_FEATURES = ["dow_sin", "dow_cos", "doy_sin", "doy_cos", "month_sin", "month_cos", "is_weekend"]
+FORECAST_FUTURE_KNOWN_FEATURES = ["dow_sin", "dow_cos", "doy_sin", "doy_cos", "month_sin", "month_cos", "is_weekend", "local_event"]
+FORECAST_SEASONAL_INDEX_FEATURES = ["dow_seasonal_index", "month_seasonal_index"]
+FORECAST_OPERATIONAL_SIGNAL_COLUMNS = {
+    "booking_pace": "Booking_Pace",
+    "bookings_created": "Bookings_Created",
+    "cancellations": "Cancellations",
+}
+FORECAST_OPERATIONAL_WINDOWS = [7, 14, 28]
+FORECAST_OPERATIONAL_STATS = ["mean", "std", "sum"]
+
+# Enhanced Boruta is allowed to choose from newly engineered features, but these
+# proven baseline features are always kept as the model's stable forecasting spine.
+FORECAST_FORCE_KEEP_FEATURES = [
+    "lag_1",
+    "lag_2",
+    "lag_3",
+    "lag_7",
+    "lag_14",
+    "lag_21",
+    "lag_28",
+    "lag_56",
+    "roll_mean_7",
+    "roll_std_7",
+    "roll_mean_14",
+    "roll_std_14",
+    "roll_mean_28",
+    "roll_std_28",
+    "roll_mean_56",
+    "roll_std_56",
+    "trend_7",
+    "trend_14",
+    "recent_min_28",
+    "recent_max_28",
+    "recent_booking_pace",
+    "recent_cancellations",
+    "origin_dow_sin",
+    "origin_dow_cos",
+    "origin_doy_sin",
+    "origin_doy_cos",
+    "origin_month_sin",
+    "origin_month_cos",
+    "origin_is_weekend",
+]
