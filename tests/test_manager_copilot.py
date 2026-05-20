@@ -163,6 +163,9 @@ class ManagerCopilotTests(unittest.TestCase):
         champion_payload = {
             "model": "random_forest_recursive",
             "metrics": {
+                "MAE_pp": 8.71504,
+                "RMSE_pp": 10.4321,
+                "Bias_pp": 0.35035,
                 "Accuracy": 87.1504,
                 "WAPE": 12.8496,
                 "Bias": 0.0035035,
@@ -174,6 +177,9 @@ class ManagerCopilotTests(unittest.TestCase):
             [
                 {
                     "Model": "random_forest_recursive",
+                    "MAE_pp": 2.9025,
+                    "RMSE_pp": 3.4567,
+                    "Bias_pp": -1.37357,
                     "Accuracy": 97.0975,
                     "WAPE": 2.9025,
                     "Bias": -0.0137357,
@@ -188,12 +194,14 @@ class ManagerCopilotTests(unittest.TestCase):
         audit = manager_copilot.build_champion_model_audit(champion_payload, audit_summary)
 
         self.assertEqual(audit["champion_model"], "random_forest_recursive")
-        self.assertEqual(audit["recent_accuracy"], 97.0975)
+        self.assertEqual(audit["recent_avg_occupancy_miss_pp"], 2.9025)
         rows = {row["Metric"]: row for row in audit["rows"]}
-        self.assertEqual(rows["Forecast Accuracy"]["Selection Backtest"], "87.2%")
-        self.assertEqual(rows["Forecast Accuracy"]["Recent Audit"], "97.1%")
-        self.assertEqual(rows["Bias"]["Selection Backtest"], "+0.35 pts")
-        self.assertEqual(rows["Bias"]["Recent Audit"], "-1.37 pts")
+        self.assertEqual(rows["Avg Occupancy Miss (MAE)"]["Selection Backtest"], "8.72 pp")
+        self.assertEqual(rows["Avg Occupancy Miss (MAE)"]["Recent Audit"], "2.90 pp")
+        self.assertEqual(rows["Large Miss Guardrail (RMSE)"]["Selection Backtest"], "10.43 pp")
+        self.assertEqual(rows["Large Miss Guardrail (RMSE)"]["Recent Audit"], "3.46 pp")
+        self.assertEqual(rows["Bias"]["Selection Backtest"], "+0.35 pp")
+        self.assertEqual(rows["Bias"]["Recent Audit"], "-1.37 pp")
         self.assertEqual(rows["Interval Coverage"]["Recent Audit"], "100.0%")
         self.assertEqual(rows["Audit Status"]["Recent Audit"], "Ok")
 

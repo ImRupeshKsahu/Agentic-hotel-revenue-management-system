@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import forecasting_core.legacy as legacy
+from forecasting_core.hyperparameter_tuning import HyperparameterTuningConfig
 
 
 @dataclass(frozen=True)
@@ -45,5 +46,12 @@ class ForecastRunConfig:
     audit_folds: int = legacy.DEFAULT_AUDIT_FOLDS
     interval_level: float = legacy.DEFAULT_INTERVAL_LEVEL
     audit_drift_threshold: float = legacy.DEFAULT_AUDIT_DRIFT_THRESHOLD
+    hyperparameter_tuning: HyperparameterTuningConfig = field(
+        default_factory=lambda: HyperparameterTuningConfig(
+            n_trials=legacy.DEFAULT_HYPERPARAM_TRIALS,
+            recent_folds=legacy.DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS,
+            mae_tie_threshold_pp=legacy.DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP,
+        )
+    )
     feature_selection: FeatureSelectionConfig = field(default_factory=FeatureSelectionConfig)
     model_competition: ModelCompetitionConfig = field(default_factory=ModelCompetitionConfig)

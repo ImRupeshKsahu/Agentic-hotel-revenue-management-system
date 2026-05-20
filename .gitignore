@@ -44,6 +44,8 @@ data/backtest_run_latest.log
 data/boruta_selection_report.csv
 data/feature_manifest.csv
 data/forecast_champion.json
+data/model_hyperparameters.json
+data/hyperparameter_tuning_report.csv
 data/live_market_state.json
 data/live_competitor_market.csv
 data/pricing_decision_log.jsonl

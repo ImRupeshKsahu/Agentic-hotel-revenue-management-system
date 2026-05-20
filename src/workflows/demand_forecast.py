@@ -27,12 +27,21 @@ from config import (
     METRICS_PATH,
     MODEL_COMPARISON_PATH,
     FEATURE_MANIFEST_PATH,
+    FORECAST_HYPERPARAM_TRIALS,
+    FORECAST_HYPERPARAM_TUNING_PATH,
+    FORECAST_HYPERPARAM_TUNING_RECENT_FOLDS,
+    FORECAST_HYPERPARAM_TUNING_REPORT_PATH,
     OTB_SNAPSHOT_PATH,
     PLOTS_DIR,
     RAW_BOOKINGS_PATH,
 )
 from pms_core.data_pipeline import refresh_daily_hotel_data
 from forecasting import ForecastEngine, load_champion
+from forecasting_core.hyperparameter_tuning import (
+    HyperparameterTuningConfig,
+    load_tuning_payload,
+    tuning_artifact_is_current,
+)
 from market_core.feed import initialize_competitor_market
 from pms_core.snapshot import calculate_otb_snapshot, export_live_market_state, load_booking_ledger
 from pms_core.live_ledger import initialize_live_ledger
@@ -69,6 +78,8 @@ def _artifact_paths():
         "audit_interval_coverage": BACKTEST_AUDIT_INTERVAL_COVERAGE_PATH,
         "feature_manifest": FEATURE_MANIFEST_PATH,
         "boruta_selection_report": BORUTA_SELECTION_REPORT_PATH,
+        "hyperparameter_tuning": FORECAST_HYPERPARAM_TUNING_PATH,
+        "hyperparameter_tuning_report": FORECAST_HYPERPARAM_TUNING_REPORT_PATH,
         "champion": FORECAST_CHAMPION_PATH,
         "plots_dir": PLOTS_DIR,
         "timeline_plot": BACKTEST_TIMELINE_PATH,
@@ -135,6 +146,9 @@ def run_forecast_mode():
     if not os.path.exists(FORECAST_CHAMPION_PATH):
         print("No forecast champion found. Running backtest mode first to select a model.")
         return run_backtest_mode()
+    if not _hyperparameter_tuning_is_current(daily_df):
+        print("Hyperparameter tuning artifact is missing or stale. Running backtest mode first to refresh tuned params.")
+        return run_backtest_mode()
 
     print("\n" + "=" * 60)
     print("RUNNING DAILY CHAMPION FORECAST")
@@ -148,6 +162,24 @@ def run_forecast_mode():
     _seed_live_pms_and_otb(forecast_df)
     _print_summary(forecast_df, metrics_df, champion, mode="forecast")
     return forecast_df, metrics_df, champion
+
+
+def _hyperparameter_tuning_is_current(daily_df):
+    payload = load_tuning_payload(FORECAST_HYPERPARAM_TUNING_PATH)
+    if not payload:
+        return False
+    history = _FORECAST_ENGINE.actuals(daily_df)
+    config = HyperparameterTuningConfig(
+        n_trials=FORECAST_HYPERPARAM_TRIALS,
+        recent_folds=FORECAST_HYPERPARAM_TUNING_RECENT_FOLDS,
+    )
+    return tuning_artifact_is_current(
+        payload,
+        history,
+        _FORECAST_ENGINE.config.model_competition.default_models,
+        FORECAST_HORIZON_DAYS,
+        config,
+    )
 
 
 def _print_summary(forecast_df, metrics_df, champion, mode):

@@ -9,6 +9,14 @@ import pandas as pd
 
 from config import FORECAST_FORCE_KEEP_FEATURES
 from feature_engineering import FeatureEngineer
+from forecasting_core.hyperparameter_tuning import (
+    ForecastHyperparameterTuner,
+    HyperparameterTuningConfig,
+    TUNING_MAE_TIE_THRESHOLD_PP,
+    load_tuning_payload,
+    save_tuning_payload,
+    tuned_params_from_payload,
+)
 
 try:
     from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
@@ -50,6 +58,11 @@ DEFAULT_MIN_TRAIN_DAYS = 365
 DEFAULT_AUDIT_FOLDS = 8
 DEFAULT_INTERVAL_LEVEL = 0.90
 DEFAULT_AUDIT_DRIFT_THRESHOLD = 0.25
+DEFAULT_HYPERPARAM_TRIALS = 5
+DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS = 5
+DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP = TUNING_MAE_TIE_THRESHOLD_PP
+MODEL_SELECTION_OBJECTIVE = "mae_pp_with_rmse_guardrail"
+MODEL_SELECTION_MAE_TIE_THRESHOLD_PP = 0.50
 BASELINE_PROFILE = "statistical"
 ENHANCED_PROFILE = "boruta_selected"
 LEGACY_BASELINE_PROFILE = "baseline"
@@ -61,6 +74,7 @@ CHAIN_BORUTA_MIN_ANCHORS = 2
 BORUTA_MAX_ITER = 10
 BORUTA_TREE_COUNT = "auto"
 BORUTA_PERC = 80
+TUNED_MODEL_PARAMS: dict[str, dict] = {}
 
 STATISTICAL_MODELS = [
     "naive",
@@ -189,9 +203,12 @@ class ForecastChampion:
     mandatory_features: list[str] = field(default_factory=list)
     feature_selection_metadata: dict = field(default_factory=dict)
     backtest_cadence_days: int = 7
+    selection_objective: str = MODEL_SELECTION_OBJECTIVE
+    mae_tie_threshold_pp: float = MODEL_SELECTION_MAE_TIE_THRESHOLD_PP
     interval_level: float = DEFAULT_INTERVAL_LEVEL
     interval_quantiles: dict = field(default_factory=dict)
     backtest_metadata: dict = field(default_factory=dict)
+    hyperparameter_tuning_metadata: dict = field(default_factory=dict)
 
 
 def _actuals(daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -229,15 +246,21 @@ def calculate_forecast_metrics(actual, predicted) -> dict:
     mape = np.nanmean(np.abs(error / non_zero)) * 100
     smape = np.nanmean(2 * np.abs(error) / np.maximum(np.abs(actual) + np.abs(predicted), 1e-6)) * 100
     wape = np.sum(np.abs(error)) / max(np.sum(np.abs(actual)), 1e-6) * 100
+    mae = np.mean(np.abs(error))
+    rmse = np.sqrt(np.mean(error**2))
     bias = np.mean(error)
 
     return {
-        "MAE": float(np.mean(np.abs(error))),
-        "RMSE": float(np.sqrt(np.mean(error**2))),
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "MAE_pp": float(mae * 100),
+        "RMSE_pp": float(rmse * 100),
         "MAPE": float(mape),
         "sMAPE": float(smape),
         "WAPE": float(wape),
         "Bias": float(bias),
+        "Bias_pp": float(bias * 100),
+        "Abs_Bias_pp": float(abs(bias * 100)),
         "Accuracy": float(max(0, 100 - wape)),
         "Volatility": float(np.std(predicted)),
         "Stability": float(1 / (1 + np.std(error))),
@@ -609,7 +632,14 @@ def _select_production_feature_schemas(
     return schemas, report, metadata
 
 
-def _base_estimator(model_name: str):
+def _model_tuned_params(model_name: str, tuned_params: Optional[dict] = None) -> dict:
+    if tuned_params is not None:
+        return dict(tuned_params)
+    return dict(TUNED_MODEL_PARAMS.get(model_name, {}))
+
+
+def _base_estimator(model_name: str, tuned_params: Optional[dict] = None):
+    tuned_params = _model_tuned_params(model_name, tuned_params)
     if model_name.startswith("ridge"):
         if Ridge is None:
             return None
@@ -621,24 +651,37 @@ def _base_estimator(model_name: str):
     if model_name.startswith("random_forest"):
         if RandomForestRegressor is None:
             return None
-        return RandomForestRegressor(n_estimators=18, min_samples_leaf=6, random_state=42, n_jobs=-1)
+        params = {"n_estimators": 18, "min_samples_leaf": 6, "random_state": 42, "n_jobs": -1}
+        params.update(tuned_params)
+        params["random_state"] = 42
+        params["n_jobs"] = -1
+        return RandomForestRegressor(**params)
     if model_name.startswith("extra_trees"):
         if ExtraTreesRegressor is None:
             return None
-        return ExtraTreesRegressor(n_estimators=24, min_samples_leaf=5, random_state=42, n_jobs=-1)
+        params = {"n_estimators": 24, "min_samples_leaf": 5, "random_state": 42, "n_jobs": -1}
+        params.update(tuned_params)
+        params["random_state"] = 42
+        params["n_jobs"] = -1
+        return ExtraTreesRegressor(**params)
     if model_name.startswith("xgboost"):
         if XGBRegressor is None:
             return None
-        return XGBRegressor(
-            n_estimators=12,
-            max_depth=2,
-            learning_rate=0.08,
-            subsample=0.9,
-            colsample_bytree=0.85,
-            objective="reg:squarederror",
-            random_state=42,
-            n_jobs=1,
-        )
+        params = {
+            "n_estimators": 12,
+            "max_depth": 2,
+            "learning_rate": 0.08,
+            "subsample": 0.9,
+            "colsample_bytree": 0.85,
+            "objective": "reg:squarederror",
+            "random_state": 42,
+            "n_jobs": 1,
+        }
+        params.update(tuned_params)
+        params["objective"] = "reg:squarederror"
+        params["random_state"] = 42
+        params["n_jobs"] = 1
+        return XGBRegressor(**params)
     return None
 
 
@@ -702,10 +745,11 @@ def _predict_chain(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
     if RegressorChain is None:
         return _predict_statistical(history, horizon, "rolling_mean_7"), []
-    estimator = _base_estimator(model_name)
+    estimator = _base_estimator(model_name, tuned_params=tuned_params)
     if estimator is None:
         return _predict_statistical(history, horizon, "rolling_mean_7"), []
     x_train, y_train, feature_schema = _build_chain_training(history, horizon=horizon, feature_profile=feature_profile)
@@ -728,8 +772,9 @@ def _predict_recursive(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
-    estimator = _base_estimator(model_name)
+    estimator = _base_estimator(model_name, tuned_params=tuned_params)
     if estimator is None:
         return _predict_statistical(history, horizon, "rolling_mean_7"), []
     x_train, y_train, feature_schema = _build_recursive_training(history, feature_profile=feature_profile)
@@ -764,6 +809,7 @@ def predict_model(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
     if model_name in STATISTICAL_MODELS:
         return np.clip(_predict_statistical(history, horizon, model_name), 0, 1), []
@@ -774,6 +820,7 @@ def predict_model(
             model_name,
             feature_profile=feature_profile,
             selected_schema=selected_schema,
+            tuned_params=tuned_params,
         )
         return np.clip(preds, 0, 1), schema
     if model_name.endswith("_recursive"):
@@ -783,6 +830,7 @@ def predict_model(
             model_name,
             feature_profile=feature_profile,
             selected_schema=selected_schema,
+            tuned_params=tuned_params,
         )
         return np.clip(preds, 0, 1), schema
     return np.clip(_predict_statistical(history, horizon, "rolling_mean_7"), 0, 1), []
@@ -890,7 +938,21 @@ def _aggregate_fold_metrics(fold_metrics: pd.DataFrame, split: str) -> pd.DataFr
     subset = subset[subset["Split"].eq(split)].copy()
     if subset.empty:
         return pd.DataFrame()
-    metric_cols = ["MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "Bias", "Accuracy", "Volatility", "Stability"]
+    subset = _ensure_point_metrics(subset)
+    metric_cols = [
+        "MAE",
+        "RMSE",
+        "MAE_pp",
+        "RMSE_pp",
+        "MAPE",
+        "sMAPE",
+        "WAPE",
+        "Bias",
+        "Bias_pp",
+        "Accuracy",
+        "Volatility",
+        "Stability",
+    ]
     grouped = (
         subset.groupby(["Feature_Profile", "Model", "Strategy"], as_index=False)
         .agg(
@@ -899,7 +961,89 @@ def _aggregate_fold_metrics(fold_metrics: pd.DataFrame, split: str) -> pd.DataFr
             **{col: (col, "mean") for col in metric_cols},
         )
     )
+    grouped["Abs_Bias"] = grouped["Bias"].abs()
+    grouped["Abs_Bias_pp"] = grouped["Bias_pp"].abs()
     return grouped
+
+
+def _ensure_point_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
+    copy = metrics.copy()
+    if "MAE_pp" not in copy.columns and "MAE" in copy.columns:
+        copy["MAE_pp"] = pd.to_numeric(copy["MAE"], errors="coerce") * 100
+    if "MAE_pp" not in copy.columns and "WAPE" in copy.columns:
+        copy["MAE_pp"] = pd.to_numeric(copy["WAPE"], errors="coerce")
+    if "RMSE_pp" not in copy.columns and "RMSE" in copy.columns:
+        copy["RMSE_pp"] = pd.to_numeric(copy["RMSE"], errors="coerce") * 100
+    if "RMSE_pp" not in copy.columns and "MAE_pp" in copy.columns:
+        copy["RMSE_pp"] = pd.to_numeric(copy["MAE_pp"], errors="coerce")
+    if "Bias_pp" not in copy.columns and "Bias" in copy.columns:
+        copy["Bias_pp"] = pd.to_numeric(copy["Bias"], errors="coerce") * 100
+    if "Bias_pp" not in copy.columns:
+        copy["Bias_pp"] = 0.0
+    if "Abs_Bias_pp" not in copy.columns and "Bias_pp" in copy.columns:
+        copy["Abs_Bias_pp"] = pd.to_numeric(copy["Bias_pp"], errors="coerce").abs()
+    if "Abs_Bias" not in copy.columns and "Bias" in copy.columns:
+        copy["Abs_Bias"] = pd.to_numeric(copy["Bias"], errors="coerce").abs()
+    if "Complexity" not in copy.columns and "Model" in copy.columns:
+        copy["Complexity"] = copy["Model"].map(MODEL_COMPLEXITY).fillna(5)
+    return copy
+
+
+def _sort_model_competition_metrics(
+    metrics: pd.DataFrame,
+    mae_tie_threshold_pp: float = MODEL_SELECTION_MAE_TIE_THRESHOLD_PP,
+) -> pd.DataFrame:
+    if metrics.empty:
+        return metrics
+    copy = _ensure_point_metrics(metrics)
+    best_mae = pd.to_numeric(copy["MAE_pp"], errors="coerce").min()
+    if not np.isfinite(best_mae):
+        return copy.sort_values(["Complexity", "Model"], ascending=[True, True])
+
+    eligible_mask = copy["MAE_pp"].le(best_mae + float(mae_tie_threshold_pp))
+    eligible = copy[eligible_mask].sort_values(
+        ["RMSE_pp", "MAE_pp", "Abs_Bias_pp", "Complexity", "Model"],
+        ascending=[True, True, True, True, True],
+    )
+    remaining = copy[~eligible_mask].sort_values(
+        ["MAE_pp", "RMSE_pp", "Abs_Bias_pp", "Complexity", "Model"],
+        ascending=[True, True, True, True, True],
+    )
+    return pd.concat([eligible, remaining], ignore_index=True)
+
+
+def _export_model_metrics(metrics: pd.DataFrame, include_audit_columns: bool = False) -> pd.DataFrame:
+    """Keep exported model/audit summaries focused on readable percent-scale metrics."""
+    if metrics.empty:
+        return metrics
+    copy = _ensure_point_metrics(metrics)
+    columns = [
+        "Feature_Profile",
+        "Model",
+        "Strategy",
+        "Folds",
+        "Observations",
+        "MAE_pp",
+        "RMSE_pp",
+        "Bias_pp",
+        "Abs_Bias_pp",
+        "MAPE",
+        "WAPE",
+        "Volatility",
+        "Stability",
+        "Complexity",
+    ]
+    if include_audit_columns:
+        columns.extend(
+            [
+                "Is_Champion",
+                "Selection_Mean_Fold_MAE_pp",
+                "Audit_Drift_Ratio",
+                "Audit_Status",
+                "Interval_Coverage",
+            ]
+        )
+    return copy[[col for col in columns if col in copy.columns]]
 
 
 def _model_specs(models: Iterable[str]) -> list[dict]:
@@ -1027,13 +1171,13 @@ def _interval_coverage(
 
 
 def _audit_status(
-    selection_mean_wape: float,
-    audit_mean_wape: float,
+    selection_mean_metric: float,
+    audit_mean_metric: float,
     drift_threshold: float = DEFAULT_AUDIT_DRIFT_THRESHOLD,
 ) -> tuple[float, str]:
     drift_ratio = (
-        float(audit_mean_wape / selection_mean_wape)
-        if np.isfinite(selection_mean_wape) and selection_mean_wape > 0 and np.isfinite(audit_mean_wape)
+        float(audit_mean_metric / selection_mean_metric)
+        if np.isfinite(selection_mean_metric) and selection_mean_metric > 0 and np.isfinite(audit_mean_metric)
         else np.nan
     )
     status = (
@@ -1136,9 +1280,7 @@ def run_backtest_detailed(
     )
     scenario_metrics = fold_metrics.copy()
     if not overall.empty:
-        overall["Abs_Bias"] = overall["Bias"].abs()
-        overall["Complexity"] = overall["Model"].map(MODEL_COMPLEXITY).fillna(5)
-        overall = overall.sort_values(["WAPE", "Abs_Bias", "RMSE", "Complexity"], ascending=[True, True, True, True])
+        overall = _sort_model_competition_metrics(overall)
     if return_feature_artifacts:
         return (
             overall,
@@ -1160,7 +1302,7 @@ def select_champion(overall_metrics: pd.DataFrame, horizon: int, feature_schema:
         feature_profile = BASELINE_PROFILE
         metrics = {}
     else:
-        winner = overall_metrics.sort_values(["WAPE", "Abs_Bias", "RMSE", "Complexity"]).iloc[0]
+        winner = _sort_model_competition_metrics(overall_metrics).iloc[0]
         model_name = winner["Model"]
         feature_profile = _normalize_feature_profile(model_name, winner.get("Feature_Profile", BASELINE_PROFILE))
         metrics = winner.drop(labels=[c for c in ["Abs_Bias", "Complexity"] if c in winner.index]).to_dict()
@@ -1172,6 +1314,8 @@ def select_champion(overall_metrics: pd.DataFrame, horizon: int, feature_schema:
         metrics=metrics,
         feature_schema=feature_schema or [],
         feature_profile=feature_profile,
+        selection_objective=MODEL_SELECTION_OBJECTIVE,
+        mae_tie_threshold_pp=MODEL_SELECTION_MAE_TIE_THRESHOLD_PP,
     )
 
 
@@ -1183,13 +1327,19 @@ def _select_champion_with_acceptance(
     if overall_metrics.empty:
         return select_champion(overall_metrics, horizon=horizon), {"acceptance_rule": "no_metrics"}
 
-    ordered = overall_metrics.sort_values(["WAPE", "Abs_Bias", "RMSE", "Complexity"])
+    ordered = _sort_model_competition_metrics(overall_metrics)
     tentative = ordered.iloc[0]
     tentative_profile = _normalize_feature_profile(tentative["Model"], tentative.get("Feature_Profile", BASELINE_PROFILE))
+    best_mae_pp = float(pd.to_numeric(_ensure_point_metrics(overall_metrics)["MAE_pp"], errors="coerce").min())
     acceptance = {
-        "acceptance_rule": "single_profile_selection_wape",
+        "acceptance_rule": MODEL_SELECTION_OBJECTIVE,
+        "selection_objective": MODEL_SELECTION_OBJECTIVE,
+        "mae_tie_threshold_pp": MODEL_SELECTION_MAE_TIE_THRESHOLD_PP,
+        "best_mae_pp": best_mae_pp,
         "tentative_model": tentative["Model"],
         "tentative_feature_profile": tentative_profile,
+        "tentative_mae_pp": float(tentative.get("MAE_pp", np.nan)),
+        "tentative_rmse_pp": float(tentative.get("RMSE_pp", np.nan)),
     }
     return select_champion(overall_metrics, horizon=horizon), {
         **acceptance,
@@ -1214,9 +1364,12 @@ def save_champion(champion: ForecastChampion, path: str):
                 "mandatory_features": champion.mandatory_features,
                 "feature_selection_metadata": champion.feature_selection_metadata,
                 "backtest_cadence_days": champion.backtest_cadence_days,
+                "selection_objective": champion.selection_objective,
+                "mae_tie_threshold_pp": champion.mae_tie_threshold_pp,
                 "interval_level": champion.interval_level,
                 "interval_quantiles": champion.interval_quantiles,
                 "backtest_metadata": champion.backtest_metadata,
+                "hyperparameter_tuning_metadata": champion.hyperparameter_tuning_metadata,
             },
             f,
             indent=4,
@@ -1252,6 +1405,7 @@ def load_champion(path: str, default_horizon: int = DEFAULT_HORIZON) -> Forecast
             interval_level=DEFAULT_INTERVAL_LEVEL,
             interval_quantiles={},
             backtest_metadata={},
+            hyperparameter_tuning_metadata={},
         )
     with open(path, "r") as f:
         data = json.load(f)
@@ -1268,9 +1422,12 @@ def load_champion(path: str, default_horizon: int = DEFAULT_HORIZON) -> Forecast
         mandatory_features=data.get("mandatory_features", []),
         feature_selection_metadata=data.get("feature_selection_metadata", {}),
         backtest_cadence_days=int(data.get("backtest_cadence_days", 7)),
+        selection_objective=data.get("selection_objective", MODEL_SELECTION_OBJECTIVE),
+        mae_tie_threshold_pp=float(data.get("mae_tie_threshold_pp", MODEL_SELECTION_MAE_TIE_THRESHOLD_PP)),
         interval_level=float(data.get("interval_level", DEFAULT_INTERVAL_LEVEL)),
         interval_quantiles=data.get("interval_quantiles", {}),
         backtest_metadata=data.get("backtest_metadata", {}),
+        hyperparameter_tuning_metadata=data.get("hyperparameter_tuning_metadata", {}),
     )
 
 
@@ -1370,7 +1527,9 @@ def _plot_lag_metrics(lag_metrics: pd.DataFrame, plots_dir: str):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    for metric in ["WAPE", "Bias", "Stability"]:
+    for metric in ["MAE_pp", "RMSE_pp", "Bias_pp", "Stability"]:
+        if metric not in lag_metrics.columns:
+            continue
         fig, ax = plt.subplots(figsize=(14, 7))
         for (feature_profile, model_name), model_df in lag_metrics.groupby(["Feature_Profile", "Model"]):
             model_df = model_df.sort_values("Lag")
@@ -1480,7 +1639,7 @@ def _plot_backtest_timeline(folds: pd.DataFrame, output_path: str):
     ax.text(
         0.99,
         0.02,
-        "One WAPE per fold → mean fold WAPE by model",
+        "MAE points first; RMSE breaks practical ties",
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -1509,6 +1668,87 @@ def save_forecast_plots(
     _plot_lag_metrics(lag_metrics, plots_dir)
 
 
+def _hyperparameter_tuning_config() -> HyperparameterTuningConfig:
+    return HyperparameterTuningConfig(
+        n_trials=DEFAULT_HYPERPARAM_TRIALS,
+        recent_folds=DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS,
+        mae_tie_threshold_pp=DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP,
+    )
+
+
+def _set_tuned_model_params(payload: dict) -> dict[str, dict]:
+    global TUNED_MODEL_PARAMS
+    TUNED_MODEL_PARAMS = tuned_params_from_payload(payload)
+    return TUNED_MODEL_PARAMS
+
+
+def _load_and_apply_hyperparameter_tuning(path: Optional[str]) -> dict:
+    payload = load_tuning_payload(path) if path else {}
+    tuned_params = _set_tuned_model_params(payload)
+    if path and payload:
+        if tuned_params:
+            print(
+                f"Loaded ML hyperparameter tuning artifact from {path} "
+                f"with {len(tuned_params)} tuned model(s).",
+                flush=True,
+            )
+        else:
+            print(
+                f"Loaded ML hyperparameter tuning artifact from {path}, "
+                f"but no tuned model params were available (status: {payload.get('_status', 'unknown')}).",
+                flush=True,
+            )
+    return payload
+
+
+def _run_and_save_hyperparameter_tuning(
+    daily_df: pd.DataFrame,
+    models: Iterable[str],
+    horizon: int,
+    paths: dict,
+) -> tuple[dict, pd.DataFrame]:
+    tuning_path = paths.get("hyperparameter_tuning")
+    report_path = paths.get("hyperparameter_tuning_report")
+    config = _hyperparameter_tuning_config()
+    tuner = ForecastHyperparameterTuner(config)
+    payload, report = tuner.tune(daily_df, models=models, horizon=horizon)
+    if tuning_path:
+        save_tuning_payload(payload, tuning_path)
+    if report_path:
+        _safe_to_csv(report, report_path, index=False)
+    _set_tuned_model_params(payload)
+    if payload.get("_status") == "skipped_optuna_unavailable":
+        print("Optuna is unavailable; using default ML hyperparameters.", flush=True)
+    elif payload.get("_status") == "skipped_no_recent_folds":
+        print("No recent full-horizon folds available; using default ML hyperparameters.", flush=True)
+    elif tuning_path:
+        print(f"Saved ML hyperparameter tuning artifact to {tuning_path}", flush=True)
+    return payload, report
+
+
+def _champion_tuning_metadata(champion: ForecastChampion, payload: dict, tuning_path: Optional[str]) -> dict:
+    model_payload = payload.get(champion.model, {}) if isinstance(payload, dict) else {}
+    return {
+        "artifact_path": tuning_path,
+        "objective": model_payload.get("objective", payload.get("_metadata", {}).get("objective")),
+        "n_trials": model_payload.get("n_trials", payload.get("_metadata", {}).get("n_trials")),
+        "recent_folds_used": model_payload.get("recent_folds_used", payload.get("_metadata", {}).get("recent_folds")),
+        "data_end_date": model_payload.get("data_end_date", payload.get("_metadata", {}).get("data_end_date")),
+        "tuned_at": model_payload.get("tuned_at", payload.get("_tuned_at")),
+        "best_params": model_payload.get("best_params", {}),
+        "best_mae_pp": model_payload.get("best_mae_pp"),
+        "best_rmse_pp": model_payload.get("best_rmse_pp"),
+        "best_bias_pp": model_payload.get("best_bias_pp"),
+        "best_abs_bias_pp": model_payload.get("best_abs_bias_pp"),
+        "best_wape": model_payload.get("best_wape"),
+        "tuning_mae_tie_threshold_pp": model_payload.get(
+            "tuning_mae_tie_threshold_pp",
+            payload.get("_metadata", {}).get("mae_tie_threshold_pp"),
+        ),
+        "status": model_payload.get("status", payload.get("_status")),
+    }
+
+
 def run_backtest_and_save(
     daily_df: pd.DataFrame,
     paths: dict,
@@ -1516,6 +1756,13 @@ def run_backtest_and_save(
     scenario_lags: Optional[Iterable[int]] = None,
     models: Optional[Iterable[str]] = None,
 ):
+    requested_models = list(models or DEFAULT_MODELS)
+    tuning_payload, _ = _run_and_save_hyperparameter_tuning(
+        daily_df,
+        models=requested_models,
+        horizon=horizon,
+        paths=paths,
+    )
     (
         overall,
         lag_metrics,
@@ -1528,7 +1775,7 @@ def run_backtest_and_save(
         production_schema_metadata,
     ) = run_backtest_detailed(
         daily_df,
-        models=models,
+        models=requested_models,
         horizon=horizon,
         scenario_lags=scenario_lags,
         return_feature_artifacts=True,
@@ -1564,24 +1811,24 @@ def run_backtest_and_save(
         else np.nan
     )
 
-    selection_mean_wape = float(champion.metrics.get("WAPE", np.nan))
+    selection_mean_mae_pp = float(champion.metrics.get("MAE_pp", np.nan))
     champion_audit_row = audit_summary[
         audit_summary["Model"].eq(champion.model)
         & audit_summary["Feature_Profile"].eq(champion.feature_profile)
     ]
-    audit_mean_wape = float(champion_audit_row["WAPE"].iloc[0]) if not champion_audit_row.empty else np.nan
-    audit_drift_ratio, audit_status = _audit_status(selection_mean_wape, audit_mean_wape)
+    audit_mean_mae_pp = float(champion_audit_row["MAE_pp"].iloc[0]) if not champion_audit_row.empty else np.nan
+    audit_drift_ratio, audit_status = _audit_status(selection_mean_mae_pp, audit_mean_mae_pp)
     if not audit_summary.empty:
         audit_summary["Is_Champion"] = (
             audit_summary["Model"].eq(champion.model)
             & audit_summary["Feature_Profile"].eq(champion.feature_profile)
         )
-        audit_summary["Selection_Mean_Fold_WAPE"] = np.nan
+        audit_summary["Selection_Mean_Fold_MAE_pp"] = np.nan
         audit_summary["Audit_Drift_Ratio"] = np.nan
         audit_summary["Audit_Status"] = ""
         audit_summary["Interval_Coverage"] = np.nan
         champion_mask = audit_summary["Is_Champion"]
-        audit_summary.loc[champion_mask, "Selection_Mean_Fold_WAPE"] = selection_mean_wape
+        audit_summary.loc[champion_mask, "Selection_Mean_Fold_MAE_pp"] = selection_mean_mae_pp
         audit_summary.loc[champion_mask, "Audit_Drift_Ratio"] = audit_drift_ratio
         audit_summary.loc[champion_mask, "Audit_Status"] = audit_status
         audit_summary.loc[champion_mask, "Interval_Coverage"] = audit_interval_coverage_overall
@@ -1609,6 +1856,8 @@ def run_backtest_and_save(
         metrics=champion.metrics,
         feature_schema=feature_schema,
         feature_profile=champion.feature_profile,
+        selection_objective=champion.selection_objective,
+        mae_tie_threshold_pp=champion.mae_tie_threshold_pp,
         selected_historical_features=selected_historical_features,
         mandatory_features=mandatory_features,
         feature_selection_metadata={
@@ -1622,6 +1871,11 @@ def run_backtest_and_save(
         backtest_cadence_days=champion.backtest_cadence_days,
         interval_level=DEFAULT_INTERVAL_LEVEL,
         interval_quantiles=interval_quantiles,
+        hyperparameter_tuning_metadata=_champion_tuning_metadata(
+            champion,
+            tuning_payload,
+            paths.get("hyperparameter_tuning"),
+        ),
         backtest_metadata={
             "fold_step_days": DEFAULT_BACKTEST_STEP_DAYS,
             "min_train_days": DEFAULT_MIN_TRAIN_DAYS,
@@ -1630,8 +1884,10 @@ def run_backtest_and_save(
             "audit_folds": int(folds["Split"].eq("audit").sum()) if not folds.empty else 0,
             "audit_drift_threshold": DEFAULT_AUDIT_DRIFT_THRESHOLD,
             "audit_status": audit_status,
-            "selection_mean_fold_wape": selection_mean_wape,
-            "audit_mean_fold_wape": audit_mean_wape,
+            "selection_objective": MODEL_SELECTION_OBJECTIVE,
+            "mae_tie_threshold_pp": MODEL_SELECTION_MAE_TIE_THRESHOLD_PP,
+            "selection_mean_fold_mae_pp": selection_mean_mae_pp,
+            "audit_mean_fold_mae_pp": audit_mean_mae_pp,
             "audit_drift_ratio": audit_drift_ratio,
             "audit_interval_coverage": audit_interval_coverage_overall,
         },
@@ -1639,15 +1895,16 @@ def run_backtest_and_save(
 
     os.makedirs(os.path.dirname(paths["forecast"]), exist_ok=True)
     _safe_to_csv(forecast, paths["forecast"], index=False)
-    _safe_to_csv(overall, paths["comparison"], index=False)
-    _safe_to_csv(overall.head(1), paths["metrics"], index=False)
+    comparison_export = _export_model_metrics(overall)
+    _safe_to_csv(comparison_export, paths["comparison"], index=False)
+    _safe_to_csv(comparison_export.head(1), paths["metrics"], index=False)
     _safe_to_csv(lag_metrics, paths["lag_metrics"], index=False)
     _safe_to_csv(scenario_metrics, paths["scenario_metrics"], index=False)
     _safe_to_csv(predictions, paths["predictions"], index=False)
     _safe_to_csv(fold_metrics, paths["fold_metrics"], index=False)
     _safe_to_csv(audit_predictions, paths["audit_predictions"], index=False)
     _safe_to_csv(audit_fold_metrics, paths["audit_fold_metrics"], index=False)
-    _safe_to_csv(audit_summary, paths["audit_summary"], index=False)
+    _safe_to_csv(_export_model_metrics(audit_summary, include_audit_columns=True), paths["audit_summary"], index=False)
     _safe_to_csv(audit_lag_metrics, paths["audit_lag_metrics"], index=False)
     _safe_to_csv(audit_interval_coverage, paths["audit_interval_coverage"], index=False)
     _safe_to_csv(feature_manifest, paths["feature_manifest"], index=False)
@@ -1660,6 +1917,7 @@ def run_backtest_and_save(
 
 def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DEFAULT_HORIZON):
     champion = load_champion(paths["champion"], default_horizon=horizon)
+    tuning_payload = _load_and_apply_hyperparameter_tuning(paths.get("hyperparameter_tuning"))
     selected_schema = champion.feature_schema or None
     selection_report = pd.DataFrame()
     schema_metadata = {}
@@ -1703,6 +1961,11 @@ def run_forecast_and_save(daily_df: pd.DataFrame, paths: dict, horizon: int = DE
             interval_level=champion.interval_level,
             interval_quantiles=champion.interval_quantiles,
             backtest_metadata=champion.backtest_metadata,
+            hyperparameter_tuning_metadata=_champion_tuning_metadata(
+                champion,
+                tuning_payload,
+                paths.get("hyperparameter_tuning"),
+            ),
         )
         save_champion(champion, paths["champion"])
         if "feature_manifest" in paths:

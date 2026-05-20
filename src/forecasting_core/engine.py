@@ -52,6 +52,9 @@ class ForecastEngine:
         legacy.DEFAULT_AUDIT_FOLDS = self.config.audit_folds
         legacy.DEFAULT_INTERVAL_LEVEL = self.config.interval_level
         legacy.DEFAULT_AUDIT_DRIFT_THRESHOLD = self.config.audit_drift_threshold
+        legacy.DEFAULT_HYPERPARAM_TRIALS = self.config.hyperparameter_tuning.n_trials
+        legacy.DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS = self.config.hyperparameter_tuning.recent_folds
+        legacy.DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP = self.config.hyperparameter_tuning.mae_tie_threshold_pp
 
         legacy.BASELINE_PROFILE = feature_selection.baseline_profile
         legacy.ENHANCED_PROFILE = feature_selection.enhanced_profile

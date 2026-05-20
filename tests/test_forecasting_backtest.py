@@ -28,6 +28,7 @@ from forecasting import (
     load_champion,
     run_backtest_detailed,
     save_champion,
+    select_champion,
 )
 import forecasting
 import forecasting_core.legacy as forecasting_impl
@@ -35,6 +36,14 @@ from forecasting_core.algorithms import ForecastPrediction, algorithm_for_model
 from forecasting_core.boruta_selector import BorutaFeatureSelector
 from forecasting_core.config import ForecastRunConfig
 from forecasting_core.engine import ForecastEngine
+import forecasting_core.hyperparameter_tuning as tuning_impl
+from forecasting_core.hyperparameter_tuning import (
+    ForecastHyperparameterTuner,
+    HyperparameterTuningConfig,
+    load_tuning_payload,
+    save_tuning_payload,
+    tuning_artifact_is_current,
+)
 from forecasting_core.model_registry import ForecastModelRegistry
 
 
@@ -376,7 +385,72 @@ class ForecastingBacktestTests(unittest.TestCase):
         overall = _aggregate_fold_metrics(fold_metrics, split="selection")
 
         self.assertEqual(float(overall.iloc[0]["WAPE"]), 5.0)
+        self.assertEqual(float(overall.iloc[0]["MAE_pp"]), 100.0)
+        self.assertEqual(float(overall.iloc[0]["RMSE_pp"]), 100.0)
+        self.assertEqual(float(overall.iloc[0]["Abs_Bias_pp"]), 0.0)
         self.assertEqual(int(overall.iloc[0]["Folds"]), 2)
+
+    def test_champion_uses_rmse_guardrail_inside_mae_tie_band(self):
+        overall = pd.DataFrame(
+            [
+                {
+                    "Feature_Profile": "boruta_selected",
+                    "Model": "lowest_mae",
+                    "Strategy": "recursive_ml",
+                    "MAE_pp": 8.0,
+                    "RMSE_pp": 12.0,
+                    "Bias_pp": 0.0,
+                    "Abs_Bias_pp": 0.0,
+                    "Complexity": 4,
+                },
+                {
+                    "Feature_Profile": "boruta_selected",
+                    "Model": "lower_large_miss",
+                    "Strategy": "recursive_ml",
+                    "MAE_pp": 8.4,
+                    "RMSE_pp": 10.0,
+                    "Bias_pp": 0.0,
+                    "Abs_Bias_pp": 0.0,
+                    "Complexity": 4,
+                },
+            ]
+        )
+
+        champion = select_champion(overall, horizon=30)
+
+        self.assertEqual(champion.model, "lower_large_miss")
+        self.assertEqual(champion.selection_objective, "mae_pp_with_rmse_guardrail")
+        self.assertEqual(champion.mae_tie_threshold_pp, 0.50)
+
+    def test_champion_rejects_lower_rmse_outside_mae_tie_band(self):
+        overall = pd.DataFrame(
+            [
+                {
+                    "Feature_Profile": "boruta_selected",
+                    "Model": "lowest_mae",
+                    "Strategy": "recursive_ml",
+                    "MAE_pp": 8.0,
+                    "RMSE_pp": 12.0,
+                    "Bias_pp": 0.0,
+                    "Abs_Bias_pp": 0.0,
+                    "Complexity": 4,
+                },
+                {
+                    "Feature_Profile": "boruta_selected",
+                    "Model": "too_far_on_average",
+                    "Strategy": "recursive_ml",
+                    "MAE_pp": 8.6,
+                    "RMSE_pp": 8.0,
+                    "Bias_pp": 0.0,
+                    "Abs_Bias_pp": 0.0,
+                    "Complexity": 4,
+                },
+            ]
+        )
+
+        champion = select_champion(overall, horizon=30)
+
+        self.assertEqual(champion.model, "lowest_mae")
 
     def test_audit_status_uses_relative_drift_threshold(self):
         ok_ratio, ok_status = _audit_status(4.0, 5.0, drift_threshold=0.25)
@@ -510,6 +584,391 @@ class ForecastingBacktestTests(unittest.TestCase):
         self.assertEqual(champion.feature_profile, "boruta_selected")
         self.assertTrue(metadata["accepted"])
         self.assertEqual(metadata["reason"], "single_profile_no_baseline_comparator")
+        self.assertEqual(metadata["acceptance_rule"], "mae_pp_with_rmse_guardrail")
+        self.assertEqual(metadata["mae_tie_threshold_pp"], 0.50)
+
+    def test_base_estimator_applies_tuned_tree_params(self):
+        if forecasting_impl.RandomForestRegressor is None:
+            self.skipTest("scikit-learn unavailable")
+
+        estimator = forecasting_impl._base_estimator(
+            "random_forest_recursive",
+            tuned_params={"n_estimators": 13, "min_samples_leaf": 3, "max_features": "sqrt"},
+        )
+
+        self.assertEqual(estimator.n_estimators, 13)
+        self.assertEqual(estimator.min_samples_leaf, 3)
+        self.assertEqual(estimator.max_features, "sqrt")
+        self.assertEqual(estimator.random_state, 42)
+
+    def test_unavailable_optuna_falls_back_to_default_params_with_report(self):
+        daily = make_daily_frame(periods=430)
+        original_optuna = tuning_impl.optuna
+        original_unavailable = forecasting_impl._unavailable_model_reason
+        try:
+            tuning_impl.optuna = None
+            forecasting_impl._unavailable_model_reason = lambda model_name: None
+
+            payload, report = ForecastHyperparameterTuner(
+                HyperparameterTuningConfig(n_trials=5, recent_folds=5)
+            ).tune(daily, models=["random_forest_recursive"], horizon=7)
+        finally:
+            tuning_impl.optuna = original_optuna
+            forecasting_impl._unavailable_model_reason = original_unavailable
+
+        self.assertEqual(payload["_status"], "skipped_optuna_unavailable")
+        self.assertEqual(report.loc[0, "Status"], "skipped_optuna_unavailable")
+        self.assertIn("MAE_pp", report.columns)
+        self.assertIn("RMSE_pp", report.columns)
+        self.assertEqual(forecasting_impl.tuned_params_from_payload(payload), {})
+
+    def test_tuning_selects_rmse_guardrail_inside_mae_tie_band(self):
+        tuner = ForecastHyperparameterTuner(
+            HyperparameterTuningConfig(n_trials=3, recent_folds=5, mae_tie_threshold_pp=0.15)
+        )
+        rows = [
+            {"Trial": 0, "MAE_pp": 10.0, "RMSE_pp": 12.0, "Abs_Bias_pp": 0.1},
+            {"Trial": 1, "MAE_pp": 10.1, "RMSE_pp": 11.0, "Abs_Bias_pp": 0.1},
+            {"Trial": 2, "MAE_pp": 10.2, "RMSE_pp": 9.0, "Abs_Bias_pp": 0.1},
+        ]
+
+        best = tuner._select_best_trial(rows)
+
+        self.assertEqual(best["Trial"], 1)
+
+    def test_skipped_tuning_artifact_is_not_current_when_ml_models_are_tunable(self):
+        daily = forecasting_impl._actuals(make_daily_frame())
+        payload = {
+            "_metadata": {
+                "objective": "recent_cv_mae_pp_rmse_guardrail",
+                "n_trials": 5,
+                "recent_folds": 5,
+                "mae_tie_threshold_pp": 0.15,
+                "horizon": 30,
+                "models": ["random_forest_recursive"],
+                "data_end_date": "2017-08-31",
+                "feature_profile": "boruta_selected",
+            },
+            "_status": "skipped_optuna_unavailable",
+        }
+        models = ["random_forest_recursive"]
+        original_unavailable = forecasting_impl._unavailable_model_reason
+        try:
+            forecasting_impl._unavailable_model_reason = lambda model_name: None
+            expected_metadata = tuning_impl._artifact_metadata(
+                daily,
+                models,
+                30,
+                HyperparameterTuningConfig(n_trials=5, recent_folds=5),
+            )
+            payload["_metadata"] = expected_metadata
+
+            is_current = tuning_artifact_is_current(
+                payload,
+                daily,
+                models,
+                30,
+                HyperparameterTuningConfig(n_trials=5, recent_folds=5),
+            )
+        finally:
+            forecasting_impl._unavailable_model_reason = original_unavailable
+
+        self.assertFalse(is_current)
+
+    def test_backtest_tunes_once_and_reuses_params_during_model_competition(self):
+        daily = make_daily_frame(periods=430)
+        seen = {"tune_calls": 0, "params_seen_by_backtest": None}
+
+        class FakeTuner:
+            def __init__(self, config):
+                self.config = config
+
+            def tune(self, daily_df, models, horizon):
+                seen["tune_calls"] += 1
+                return (
+                    {
+                        "_metadata": {
+                            "objective": "recent_cv_mae_pp_rmse_guardrail",
+                            "n_trials": 5,
+                            "recent_folds": 5,
+                            "mae_tie_threshold_pp": 0.15,
+                            "horizon": horizon,
+                            "models": ["random_forest_recursive"],
+                            "data_end_date": "2016-09-03",
+                        },
+                        "_tuned_at": "2026-05-20T00:00:00",
+                        "_status": "ok",
+                        "random_forest_recursive": {
+                            "best_params": {"n_estimators": 17, "min_samples_leaf": 4},
+                            "best_mae_pp": 10.0,
+                            "best_rmse_pp": 10.0,
+                            "best_bias_pp": 0.0,
+                            "best_abs_bias_pp": 0.0,
+                            "best_wape": 11.0,
+                            "n_trials": 5,
+                            "objective": "recent_cv_mae_pp_rmse_guardrail",
+                            "tuning_mae_tie_threshold_pp": 0.15,
+                            "recent_folds_used": 5,
+                            "data_end_date": "2016-09-03",
+                            "strategy": "recursive_ml",
+                            "tuned_at": "2026-05-20T00:00:00",
+                        },
+                    },
+                    pd.DataFrame(
+                        [
+                            {
+                                "Model": "random_forest_recursive",
+                                "Trial": 0,
+                                "Params": '{"n_estimators": 17, "min_samples_leaf": 4}',
+                                "MAE_pp": 10.0,
+                                "RMSE_pp": 10.0,
+                                "Bias_pp": 0.0,
+                                "Abs_Bias_pp": 0.0,
+                                "WAPE": 11.0,
+                                "Folds_Used": 5,
+                                "Status": "ok",
+                            }
+                        ]
+                    ),
+                )
+
+        def fake_backtest(*args, **kwargs):
+            seen["params_seen_by_backtest"] = dict(forecasting_impl.TUNED_MODEL_PARAMS)
+            overall = pd.DataFrame(
+                [
+                    {
+                        "Feature_Profile": "boruta_selected",
+                        "Model": "random_forest_recursive",
+                        "Strategy": "recursive_ml",
+                        "Folds": 1,
+                        "Observations": 7,
+                        "MAE": 0.1,
+                        "RMSE": 0.1,
+                        "MAPE": 10.0,
+                        "sMAPE": 10.0,
+                        "WAPE": 11.0,
+                        "Bias": 0.0,
+                        "Abs_Bias": 0.0,
+                        "Accuracy": 89.0,
+                        "Volatility": 0.0,
+                        "Stability": 1.0,
+                        "Complexity": 4,
+                    }
+                ]
+            )
+            predictions = pd.DataFrame(
+                [
+                    {
+                        "Feature_Profile": "boruta_selected",
+                        "Model": "random_forest_recursive",
+                        "Strategy": "recursive_ml",
+                        "Fold_ID": "fold_001",
+                        "Split": "selection",
+                        "Cutoff": pd.Timestamp("2016-01-01"),
+                        "Lag": 1,
+                        "Date": pd.Timestamp("2016-01-02"),
+                        "Actual": 0.5,
+                        "Predicted": 0.5,
+                    }
+                ]
+            )
+            fold_metrics = pd.DataFrame(
+                [
+                    {
+                        "Split": "audit",
+                        "Fold_ID": "fold_002",
+                        "Feature_Profile": "boruta_selected",
+                        "Model": "random_forest_recursive",
+                        "Strategy": "recursive_ml",
+                        "Cutoff": pd.Timestamp("2016-01-08"),
+                        "Observations": 7,
+                        "MAE": 0.1,
+                        "RMSE": 0.1,
+                        "MAPE": 10.0,
+                        "sMAPE": 10.0,
+                        "WAPE": 11.0,
+                        "Bias": 0.0,
+                        "Accuracy": 89.0,
+                        "Volatility": 0.0,
+                        "Stability": 1.0,
+                    }
+                ]
+            )
+            folds = pd.DataFrame({"Split": ["selection", "audit"], "Cutoff": [pd.Timestamp("2016-01-01"), pd.Timestamp("2016-01-08")]})
+            return overall, pd.DataFrame(), pd.DataFrame(), predictions, fold_metrics, folds, pd.DataFrame(), {}, {}
+
+        def fake_forecast(*args, **kwargs):
+            dates = pd.date_range("2016-01-02", periods=7, freq="D")
+            return (
+                pd.DataFrame(
+                    {
+                        "Date": dates,
+                        "Forecasted_Occupancy": np.repeat(0.5, 7),
+                        "Min_Occupancy": np.repeat(0.4, 7),
+                        "Max_Occupancy": np.repeat(0.6, 7),
+                        "Competitor_Rate": np.repeat(120.0, 7),
+                        "Selected_Model": "random_forest_recursive",
+                        "Feature_Profile": "boruta_selected",
+                    }
+                ),
+                ["lag_1"],
+            )
+
+        original_tuner = forecasting_impl.ForecastHyperparameterTuner
+        original_backtest = forecasting_impl.run_backtest_detailed
+        original_forecast = forecasting_impl.forecast_demand
+        original_save_plots = forecasting_impl.save_forecast_plots
+        original_timeline = forecasting_impl._plot_backtest_timeline
+        original_params = dict(forecasting_impl.TUNED_MODEL_PARAMS)
+        try:
+            forecasting_impl.ForecastHyperparameterTuner = FakeTuner
+            forecasting_impl.run_backtest_detailed = fake_backtest
+            forecasting_impl.forecast_demand = fake_forecast
+            forecasting_impl.save_forecast_plots = lambda *args, **kwargs: None
+            forecasting_impl._plot_backtest_timeline = lambda *args, **kwargs: None
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                paths = {
+                    "forecast": str(tmp / "forecast.csv"),
+                    "metrics": str(tmp / "metrics.csv"),
+                    "comparison": str(tmp / "comparison.csv"),
+                    "lag_metrics": str(tmp / "lag.csv"),
+                    "scenario_metrics": str(tmp / "scenario.csv"),
+                    "predictions": str(tmp / "predictions.csv"),
+                    "fold_metrics": str(tmp / "folds.csv"),
+                    "audit_predictions": str(tmp / "audit_predictions.csv"),
+                    "audit_fold_metrics": str(tmp / "audit_folds.csv"),
+                    "audit_summary": str(tmp / "audit_summary.csv"),
+                    "audit_lag_metrics": str(tmp / "audit_lag.csv"),
+                    "audit_interval_coverage": str(tmp / "audit_interval.csv"),
+                    "feature_manifest": str(tmp / "feature_manifest.csv"),
+                    "boruta_selection_report": str(tmp / "boruta.csv"),
+                    "hyperparameter_tuning": str(tmp / "model_hyperparameters.json"),
+                    "hyperparameter_tuning_report": str(tmp / "hyperparameter_tuning_report.csv"),
+                    "champion": str(tmp / "champion.json"),
+                    "plots_dir": str(tmp / "plots"),
+                    "timeline_plot": str(tmp / "timeline.png"),
+                }
+                _, _, champion = forecasting_impl.run_backtest_and_save(
+                    daily,
+                    paths,
+                    horizon=7,
+                    models=["random_forest_recursive"],
+                )
+                saved = load_champion(paths["champion"])
+                tuning_payload = load_tuning_payload(paths["hyperparameter_tuning"])
+                comparison_columns = pd.read_csv(paths["comparison"]).columns.tolist()
+                audit_summary_columns = pd.read_csv(paths["audit_summary"]).columns.tolist()
+        finally:
+            forecasting_impl.ForecastHyperparameterTuner = original_tuner
+            forecasting_impl.run_backtest_detailed = original_backtest
+            forecasting_impl.forecast_demand = original_forecast
+            forecasting_impl.save_forecast_plots = original_save_plots
+            forecasting_impl._plot_backtest_timeline = original_timeline
+            forecasting_impl.TUNED_MODEL_PARAMS = original_params
+
+        self.assertEqual(seen["tune_calls"], 1)
+        self.assertEqual(
+            seen["params_seen_by_backtest"],
+            {"random_forest_recursive": {"n_estimators": 17, "min_samples_leaf": 4}},
+        )
+        self.assertEqual(champion.hyperparameter_tuning_metadata["best_params"]["n_estimators"], 17)
+        self.assertEqual(saved.hyperparameter_tuning_metadata["best_params"]["min_samples_leaf"], 4)
+        self.assertEqual(champion.hyperparameter_tuning_metadata["best_mae_pp"], 10.0)
+        self.assertEqual(champion.hyperparameter_tuning_metadata["tuning_mae_tie_threshold_pp"], 0.15)
+        self.assertEqual(tuning_payload["random_forest_recursive"]["best_wape"], 11.0)
+        self.assertEqual(tuning_payload["random_forest_recursive"]["best_rmse_pp"], 10.0)
+        self.assertIn("MAE_pp", comparison_columns)
+        self.assertIn("RMSE_pp", comparison_columns)
+        self.assertIn("Volatility", comparison_columns)
+        self.assertIn("Stability", comparison_columns)
+        self.assertNotIn("MAE", comparison_columns)
+        self.assertNotIn("RMSE", comparison_columns)
+        self.assertNotIn("sMAPE", comparison_columns)
+        self.assertIn("Selection_Mean_Fold_MAE_pp", audit_summary_columns)
+        self.assertIn("Volatility", audit_summary_columns)
+        self.assertIn("Stability", audit_summary_columns)
+        self.assertNotIn("sMAPE", audit_summary_columns)
+
+    def test_forecast_loads_saved_tuning_params_without_retuning(self):
+        daily = make_daily_frame(periods=430)
+        champion = ForecastChampion(
+            model="random_forest_recursive",
+            strategy="recursive_ml",
+            horizon=7,
+            selected_at="2026-05-20T00:00:00",
+            metrics={"WAPE": 10.0},
+            feature_schema=["lag_1"],
+            feature_profile="boruta_selected",
+        )
+        payload = {
+            "_metadata": {"objective": "recent_cv_mae_pp_rmse_guardrail"},
+            "_tuned_at": "2026-05-20T00:00:00",
+            "_status": "ok",
+            "random_forest_recursive": {
+                "best_params": {"n_estimators": 19, "min_samples_leaf": 5},
+                "best_wape": 9.5,
+                "n_trials": 5,
+                "objective": "recent_cv_mae_pp_rmse_guardrail",
+                "recent_folds_used": 5,
+                "data_end_date": "2016-09-03",
+                "strategy": "recursive_ml",
+                "tuned_at": "2026-05-20T00:00:00",
+            },
+        }
+        seen = {"params_seen": None}
+
+        def fake_forecast(*args, **kwargs):
+            seen["params_seen"] = dict(forecasting_impl.TUNED_MODEL_PARAMS)
+            dates = pd.date_range("2016-01-02", periods=7, freq="D")
+            return (
+                pd.DataFrame(
+                    {
+                        "Date": dates,
+                        "Forecasted_Occupancy": np.repeat(0.5, 7),
+                        "Min_Occupancy": np.repeat(0.4, 7),
+                        "Max_Occupancy": np.repeat(0.6, 7),
+                        "Competitor_Rate": np.repeat(120.0, 7),
+                        "Selected_Model": "random_forest_recursive",
+                        "Feature_Profile": "boruta_selected",
+                    }
+                ),
+                ["lag_1"],
+            )
+
+        original_tuner = forecasting_impl.ForecastHyperparameterTuner
+        original_forecast = forecasting_impl.forecast_demand
+        original_plot = forecasting_impl._plot_best_model_forecast
+        original_params = dict(forecasting_impl.TUNED_MODEL_PARAMS)
+        try:
+            forecasting_impl.ForecastHyperparameterTuner = lambda *args, **kwargs: self.fail("forecast should not tune")
+            forecasting_impl.forecast_demand = fake_forecast
+            forecasting_impl._plot_best_model_forecast = lambda *args, **kwargs: None
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                champion_path = tmp / "champion.json"
+                tuning_path = tmp / "model_hyperparameters.json"
+                save_champion(champion, str(champion_path))
+                save_tuning_payload(payload, str(tuning_path))
+                paths = {
+                    "champion": str(champion_path),
+                    "hyperparameter_tuning": str(tuning_path),
+                    "forecast": str(tmp / "forecast.csv"),
+                    "plots_dir": str(tmp / "plots"),
+                }
+                forecast_df, loaded = forecasting_impl.run_forecast_and_save(daily, paths, horizon=7)
+        finally:
+            forecasting_impl.ForecastHyperparameterTuner = original_tuner
+            forecasting_impl.forecast_demand = original_forecast
+            forecasting_impl._plot_best_model_forecast = original_plot
+            forecasting_impl.TUNED_MODEL_PARAMS = original_params
+
+        self.assertEqual(
+            seen["params_seen"],
+            {"random_forest_recursive": {"n_estimators": 19, "min_samples_leaf": 5}},
+        )
+        self.assertEqual(len(forecast_df), 7)
+        self.assertEqual(loaded.model, "random_forest_recursive")
 
 
 if __name__ == "__main__":

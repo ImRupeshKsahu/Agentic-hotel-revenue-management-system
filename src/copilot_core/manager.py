@@ -244,9 +244,14 @@ def _format_pct(value: Any) -> str:
     return "n/a" if pd.isna(number) else f"{number:.1f}%"
 
 
-def _format_bias_pts(value: Any) -> str:
+def _format_pp(value: Any) -> str:
     number = _safe_float(value, fallback=float("nan"))
-    return "n/a" if pd.isna(number) else f"{number * 100:+.2f} pts"
+    return "n/a" if pd.isna(number) else f"{number:.2f} pp"
+
+
+def _format_signed_pp(value: Any) -> str:
+    number = _safe_float(value, fallback=float("nan"))
+    return "n/a" if pd.isna(number) else f"{number:+.2f} pp"
 
 
 def _format_decimal(value: Any) -> str:
@@ -265,7 +270,20 @@ def build_champion_model_audit(champion_payload: Dict[str, Any], audit_summary: 
         if not champion_rows.empty:
             audit_row = champion_rows.iloc[0]
 
-    recent_accuracy = _safe_float(audit_row.get("Accuracy"), fallback=float("nan"))
+    def point_metric(source: Any, pp_name: str, raw_name: str) -> float:
+        if isinstance(source, pd.Series):
+            pp_value = source.get(pp_name)
+            raw_value = source.get(raw_name)
+        else:
+            pp_value = source.get(pp_name) if isinstance(source, dict) else None
+            raw_value = source.get(raw_name) if isinstance(source, dict) else None
+        pp_number = _safe_float(pp_value, fallback=float("nan"))
+        if not pd.isna(pp_number):
+            return pp_number
+        raw_number = _safe_float(raw_value, fallback=float("nan"))
+        return float("nan") if pd.isna(raw_number) else raw_number * 100
+
+    recent_avg_occupancy_miss_pp = point_metric(audit_row, "MAE_pp", "MAE")
     audit_status_value = audit_row.get("Audit_Status")
     if pd.isna(audit_status_value) or not str(audit_status_value).strip():
         audit_status_value = champion_payload.get("backtest_metadata", {}).get("audit_status")
@@ -276,24 +294,19 @@ def build_champion_model_audit(champion_payload: Dict[str, Any], audit_summary: 
     )
     rows = [
         {
-            "Metric": "Forecast Accuracy",
-            "Selection Backtest": _format_pct(selection_metrics.get("Accuracy")),
-            "Recent Audit": _format_pct(audit_row.get("Accuracy")),
+            "Metric": "Avg Occupancy Miss (MAE)",
+            "Selection Backtest": _format_pp(point_metric(selection_metrics, "MAE_pp", "MAE")),
+            "Recent Audit": _format_pp(point_metric(audit_row, "MAE_pp", "MAE")),
         },
         {
-            "Metric": "WAPE",
-            "Selection Backtest": _format_pct(selection_metrics.get("WAPE")),
-            "Recent Audit": _format_pct(audit_row.get("WAPE")),
+            "Metric": "Large Miss Guardrail (RMSE)",
+            "Selection Backtest": _format_pp(point_metric(selection_metrics, "RMSE_pp", "RMSE")),
+            "Recent Audit": _format_pp(point_metric(audit_row, "RMSE_pp", "RMSE")),
         },
         {
             "Metric": "Bias",
-            "Selection Backtest": _format_bias_pts(selection_metrics.get("Bias")),
-            "Recent Audit": _format_bias_pts(audit_row.get("Bias")),
-        },
-        {
-            "Metric": "Stability",
-            "Selection Backtest": _format_decimal(selection_metrics.get("Stability")),
-            "Recent Audit": _format_decimal(audit_row.get("Stability")),
+            "Selection Backtest": _format_signed_pp(point_metric(selection_metrics, "Bias_pp", "Bias")),
+            "Recent Audit": _format_signed_pp(point_metric(audit_row, "Bias_pp", "Bias")),
         },
         {
             "Metric": "Interval Coverage",
@@ -308,7 +321,8 @@ def build_champion_model_audit(champion_payload: Dict[str, Any], audit_summary: 
     ]
     return {
         "champion_model": champion_model,
-        "recent_accuracy": recent_accuracy,
+        "recent_avg_occupancy_miss_pp": recent_avg_occupancy_miss_pp,
+        "recent_accuracy": _safe_float(audit_row.get("Accuracy"), fallback=float("nan")),
         "audit_status": audit_status,
         "rows": rows,
     }

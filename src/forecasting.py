@@ -29,6 +29,7 @@ from forecasting_core.config import (
     ModelCompetitionConfig,
 )
 from forecasting_core.engine import ForecastEngine
+from forecasting_core.hyperparameter_tuning import ForecastHyperparameterTuner, HyperparameterTuningConfig
 import forecasting_core.legacy as _legacy
 from forecasting_core.model_registry import ForecastModelRegistry
 from forecasting_core.plots import ForecastPlotter
@@ -41,6 +42,11 @@ DEFAULT_MIN_TRAIN_DAYS = _legacy.DEFAULT_MIN_TRAIN_DAYS
 DEFAULT_AUDIT_FOLDS = _legacy.DEFAULT_AUDIT_FOLDS
 DEFAULT_INTERVAL_LEVEL = _legacy.DEFAULT_INTERVAL_LEVEL
 DEFAULT_AUDIT_DRIFT_THRESHOLD = _legacy.DEFAULT_AUDIT_DRIFT_THRESHOLD
+DEFAULT_HYPERPARAM_TRIALS = _legacy.DEFAULT_HYPERPARAM_TRIALS
+DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS = _legacy.DEFAULT_HYPERPARAM_TUNING_RECENT_FOLDS
+DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP = _legacy.DEFAULT_HYPERPARAM_TUNING_MAE_TIE_THRESHOLD_PP
+MODEL_SELECTION_OBJECTIVE = _legacy.MODEL_SELECTION_OBJECTIVE
+MODEL_SELECTION_MAE_TIE_THRESHOLD_PP = _legacy.MODEL_SELECTION_MAE_TIE_THRESHOLD_PP
 BASELINE_PROFILE = _legacy.BASELINE_PROFILE
 ENHANCED_PROFILE = _legacy.ENHANCED_PROFILE
 DEFAULT_FEATURE_PROFILES = _legacy.DEFAULT_FEATURE_PROFILES
@@ -243,9 +249,9 @@ def _select_production_feature_schemas(
     return _legacy._select_production_feature_schemas(history, horizon, model_specs)
 
 
-def _base_estimator(model_name: str):
+def _base_estimator(model_name: str, tuned_params: Optional[dict] = None):
     _sync_facade_overrides()
-    return _legacy._base_estimator(model_name)
+    return _legacy._base_estimator(model_name, tuned_params=tuned_params)
 
 
 def _predict_statistical(history: pd.DataFrame, horizon: int, model_name: str):
@@ -259,9 +265,10 @@ def _predict_chain(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
     _sync_facade_overrides()
-    return _legacy._predict_chain(history, horizon, model_name, feature_profile, selected_schema)
+    return _legacy._predict_chain(history, horizon, model_name, feature_profile, selected_schema, tuned_params)
 
 
 def _predict_recursive(
@@ -270,9 +277,10 @@ def _predict_recursive(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
     _sync_facade_overrides()
-    return _legacy._predict_recursive(history, horizon, model_name, feature_profile, selected_schema)
+    return _legacy._predict_recursive(history, horizon, model_name, feature_profile, selected_schema, tuned_params)
 
 
 def predict_model(
@@ -281,9 +289,10 @@ def predict_model(
     model_name: str,
     feature_profile: str = BASELINE_PROFILE,
     selected_schema: Optional[list[str]] = None,
+    tuned_params: Optional[dict] = None,
 ):
     _sync_facade_overrides()
-    return _legacy.predict_model(history, horizon, model_name, feature_profile, selected_schema)
+    return _legacy.predict_model(history, horizon, model_name, feature_profile, selected_schema, tuned_params)
 
 
 def _generate_weekly_folds(
@@ -501,10 +510,12 @@ __all__ = [
     "ForecastBacktester",
     "ForecastChampion",
     "ForecastEngine",
+    "ForecastHyperparameterTuner",
     "ForecastModelRegistry",
     "ForecastPlotter",
     "ForecastPrediction",
     "ForecastRunConfig",
+    "HyperparameterTuningConfig",
     "ModelCompetitionConfig",
     "RecursiveMLAlgorithm",
     "StatisticalAlgorithm",

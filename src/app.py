@@ -257,6 +257,51 @@ def humanize_label(value):
     return str(value).replace("_", " ").strip().title()
 
 
+def compact_metric_display(df):
+    if df.empty:
+        return df
+    display = df.copy()
+    if "MAE_pp" not in display.columns and "MAE" in display.columns:
+        display["MAE_pp"] = pd.to_numeric(display["MAE"], errors="coerce") * 100
+    if "RMSE_pp" not in display.columns and "RMSE" in display.columns:
+        display["RMSE_pp"] = pd.to_numeric(display["RMSE"], errors="coerce") * 100
+    if "Bias_pp" not in display.columns and "Bias" in display.columns:
+        display["Bias_pp"] = pd.to_numeric(display["Bias"], errors="coerce") * 100
+    if "Abs_Bias_pp" not in display.columns and "Bias_pp" in display.columns:
+        display["Abs_Bias_pp"] = pd.to_numeric(display["Bias_pp"], errors="coerce").abs()
+
+    columns = [
+        "Feature_Profile",
+        "Model",
+        "Strategy",
+        "Folds",
+        "Observations",
+        "MAE_pp",
+        "RMSE_pp",
+        "Bias_pp",
+        "Abs_Bias_pp",
+        "MAPE",
+        "WAPE",
+        "Volatility",
+        "Stability",
+        "Complexity",
+    ]
+    labels = {
+        "Feature_Profile": "Profile",
+        "Observations": "Obs",
+        "MAE_pp": "Avg Error % (MAE)",
+        "RMSE_pp": "Large Error % (RMSE)",
+        "Bias_pp": "Bias %",
+        "Abs_Bias_pp": "Abs Bias %",
+        "MAPE": "MAPE %",
+        "WAPE": "WAPE %",
+    }
+    display = display[[col for col in columns if col in display.columns]].rename(columns=labels)
+    numeric_cols = display.select_dtypes(include="number").columns
+    display[numeric_cols] = display[numeric_cols].round(2)
+    return display
+
+
 def format_pct(value):
     return f"{float(value) * 100:.1f}%"
 
@@ -651,10 +696,10 @@ elif app_mode == "Market Outlook":
     champion_audit = build_champion_model_audit(champion_payload, audit_summary_df)
 
     c1, c2, c3, c4 = st.columns(4)
-    recent_accuracy = champion_audit["recent_accuracy"]
+    recent_avg_miss_pp = champion_audit["recent_avg_occupancy_miss_pp"]
     c1.metric("30-Day Booked Room Nights", f"{outlook_metrics['booked_room_nights']:,.0f}")
     c2.metric("Likely Retained Room Nights", f"{outlook_metrics['retained_room_nights']:,.0f}")
-    c3.metric("Recent Forecast Accuracy", "n/a" if pd.isna(recent_accuracy) else f"{recent_accuracy:.1f}%")
+    c3.metric("Recent Avg Occupancy Miss (MAE)", "n/a" if pd.isna(recent_avg_miss_pp) else f"{recent_avg_miss_pp:.1f} pp")
     c4.metric("High-Demand Market Dates", outlook_metrics["high_demand_market_dates"])
 
     render_booking_quality_trend(opportunity_records)
@@ -711,7 +756,7 @@ elif app_mode == "Market Outlook":
     st.dataframe(pd.DataFrame(champion_audit["rows"]), use_container_width=True, hide_index=True)
     with st.expander("Show full model comparison"):
         if not metrics_df.empty:
-            st.dataframe(metrics_df, use_container_width=True, height=260, hide_index=True)
+            st.dataframe(compact_metric_display(metrics_df), use_container_width=True, height=260, hide_index=True)
         else:
             st.info("Run forecast backtesting to populate model comparison metrics.")
 
