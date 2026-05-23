@@ -19,6 +19,12 @@ from config import (
 )
 from pricing_core.engine import calculate_recommended_price
 from copilot_core.pricing_agent import run_agentic_pricing
+from copilot_core.scenario_copilot import (
+    ScenarioChatContext,
+    ScenarioConversationMemory,
+    update_conversation_memory,
+)
+from copilot_core.scenario_llm_copilot import handle_grounded_scenario_chat
 from pricing_core.local_intel import estimate_local_intel_impact
 from copilot_core.manager import (
     build_briefing_payload,
@@ -384,8 +390,8 @@ def render_price_trace(agent_result):
         st.dataframe(pd.DataFrame(guardrail_rows), use_container_width=True, hide_index=True)
 
 
-def render_technical_trace(agent_result):
-    with st.expander("Show Technical Trace"):
+def render_technical_trace(agent_result, use_expander=True):
+    def render_trace_body():
         st.write(f"**Applied Logic Flags:** {agent_result.get('logic_flags', [])}")
         st.write(f"**Forecasted Occupancy:** {agent_result.get('forecasted_occupancy', 0) * 100:.1f}%")
         st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
@@ -400,6 +406,154 @@ def render_technical_trace(agent_result):
         st.write(f"**Total Optimizer Demand Shock:** {agent_result.get('total_demand_shock', 0) * 100:+.1f}%")
         st.write(f"**Guardrails Applied:** {agent_result.get('guardrails_applied', [])}")
         st.write(f"**Manual Approval Required:** {agent_result.get('manual_approval_required', False)}")
+
+    if use_expander:
+        with st.expander("Show Technical Trace"):
+            render_trace_body()
+    else:
+        st.subheader("Technical Trace")
+        render_trace_body()
+
+
+def render_scenario_result(agent_result, scenario_state=None, technical_expander=True):
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Final ADR", f"${agent_result.get('final_adr', 0.0):.2f}")
+    c2.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
+    c3.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
+    c4.metric("Pricing Pace", f"{agent_result.get('pricing_pace_index', 1.0)}x")
+
+    st.markdown("---")
+
+    st.subheader("AI Advisory Briefing")
+    action_label = agent_result.get("ai_recommended_action", agent_result.get("strategy_applied", "Review Before Publishing"))
+    risk_label = agent_result.get("ai_risk_level", "Medium")
+    banner_text = f"{action_label} | Risk: {risk_label}"
+    if action_label == "Accept Optimizer Price":
+        st.success(banner_text)
+    elif action_label in ["Hold For Manual Approval", "Investigate Data Quality"]:
+        st.error(banner_text)
+    else:
+        st.warning(banner_text)
+    st.info(escape_streamlit_markdown(normalize_reasoning(agent_result.get("strategic_reasoning", ""))))
+
+    result_state = scenario_state or agent_result.get("market_state") or {}
+    if result_state:
+        scenario_record = {
+            "current_otb": float(result_state.get("current_otb", 0.0)),
+            "expected_cancellations": float(
+                result_state.get("expected_cancellations", agent_result.get("expected_cancellations", 0.0))
+            ),
+            "adjusted_otb": float(result_state.get("adjusted_otb", result_state.get("current_otb", 0.0))),
+        }
+        render_selected_booking_quality(scenario_record)
+
+    render_technical_trace(agent_result, use_expander=technical_expander)
+    render_price_trace(agent_result)
+
+
+def append_scenario_chat_response(response, user_message=""):
+    answer = response.answer
+    sources = []
+    for item in list(response.source_labels or []) + list(response.grounding_sources or []):
+        if item and item not in sources:
+            sources.append(item)
+    if response.assumptions:
+        answer = f"{answer}\n\nAssumptions: {'; '.join(response.assumptions)}"
+    if response.safety_flags:
+        answer = f"{answer}\n\nSafety: {'; '.join(response.safety_flags)}"
+    if sources:
+        answer = f"{answer}\n\nSources: {', '.join(sources)}"
+    st.session_state.scenario_copilot_messages.append({"role": "assistant", "content": answer})
+    st.session_state.scenario_copilot_pending_draft = (
+        response.draft if response.confirmation_prompt else None
+    )
+    if response.scenario_result:
+        st.session_state.scenario_copilot_latest_result = response.scenario_result
+    if response.clarification_question:
+        st.session_state.scenario_copilot_clarification_count = (
+            st.session_state.get("scenario_copilot_clarification_count", 0) + 1
+        )
+    else:
+        st.session_state.scenario_copilot_clarification_count = 0
+    st.session_state.scenario_copilot_memory = update_conversation_memory(
+        st.session_state.get("scenario_copilot_memory", ScenarioConversationMemory()),
+        user_message,
+        response,
+    )
+
+
+def reset_scenario_copilot_chat():
+    st.session_state.scenario_copilot_messages = [
+        {
+            "role": "assistant",
+            "content": (
+                "I can answer Scenario Lab questions, prepare local-intel scenarios, "
+                "and run simulations after price-changing inputs are confirmed."
+            ),
+        }
+    ]
+    st.session_state.scenario_copilot_pending_draft = None
+    st.session_state.scenario_copilot_latest_result = None
+    st.session_state.scenario_copilot_clarification_count = 0
+    st.session_state.scenario_copilot_memory = ScenarioConversationMemory()
+
+
+def render_scenario_copilot_chat(context):
+    st.subheader("Scenario Copilot Chat")
+    st.caption("Ask about the selected date, local intel, market position, pace, or run a confirmed scenario.")
+
+    if "scenario_copilot_messages" not in st.session_state:
+        reset_scenario_copilot_chat()
+    if "scenario_copilot_pending_draft" not in st.session_state:
+        st.session_state.scenario_copilot_pending_draft = None
+    if "scenario_copilot_latest_result" not in st.session_state:
+        st.session_state.scenario_copilot_latest_result = None
+    if "scenario_copilot_clarification_count" not in st.session_state:
+        st.session_state.scenario_copilot_clarification_count = 0
+    if "scenario_copilot_memory" not in st.session_state:
+        st.session_state.scenario_copilot_memory = ScenarioConversationMemory()
+
+    if st.button("Start Over", key="scenario_copilot_start_over"):
+        reset_scenario_copilot_chat()
+        st.rerun()
+
+    for message in st.session_state.scenario_copilot_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(escape_streamlit_markdown(message["content"]))
+
+    pending_draft = st.session_state.scenario_copilot_pending_draft
+    if pending_draft:
+        prompt = "Confirm this scenario before price-changing inputs are applied."
+        st.warning(prompt)
+        confirm_col, context_col, clear_col = st.columns(3)
+        if confirm_col.button("Apply and Run", key="scenario_copilot_apply_run"):
+            response = handle_grounded_scenario_chat("confirm and run", context, pending_draft)
+            append_scenario_chat_response(response, "confirm and run")
+            st.rerun()
+        if context_col.button("Run Context Only", key="scenario_copilot_context_only"):
+            response = handle_grounded_scenario_chat("run context only", context, pending_draft)
+            append_scenario_chat_response(response, "run context only")
+            st.rerun()
+        if clear_col.button("Clear Draft", key="scenario_copilot_clear"):
+            st.session_state.scenario_copilot_pending_draft = None
+            st.rerun()
+
+    user_message = st.chat_input("Ask Scenario Copilot")
+    if user_message:
+        st.session_state.scenario_copilot_messages.append({"role": "user", "content": user_message})
+        with st.chat_message("user"):
+            st.markdown(escape_streamlit_markdown(user_message))
+        response = handle_grounded_scenario_chat(user_message, context, st.session_state.scenario_copilot_pending_draft)
+        append_scenario_chat_response(response, user_message)
+        if response.confirmation_prompt:
+            st.rerun()
+        with st.chat_message("assistant"):
+            st.markdown(escape_streamlit_markdown(st.session_state.scenario_copilot_messages[-1]["content"]))
+
+    latest_result = st.session_state.get("scenario_copilot_latest_result")
+    if latest_result:
+        with st.expander("Latest Chat Simulation Result", expanded=True):
+            render_scenario_result(latest_result, technical_expander=False)
 
 
 def build_booking_quality_plot_df(records):
@@ -854,6 +1008,26 @@ else:
     total_baseline_shock = demand_shock + local_intel_applied_shock
     st.sidebar.caption(f"Total demand shock included in optimizer: {total_baseline_shock * 100:+.1f}%")
 
+    scenario_horizon_records = build_opportunity_records(forecast_df, live_market)
+    scenario_horizon_summary = build_summary_metrics(scenario_horizon_records)
+    scenario_chat_context = ScenarioChatContext(
+        target_date=d_str,
+        forecasted_occupancy=float(forecasted_occ),
+        current_state=current_state,
+        manual_demand_shock=demand_shock,
+        latest_result=st.session_state.get("scenario_copilot_latest_result"),
+        live_market_by_date=live_market,
+        forecast_occupancy_by_date={
+            row.Date.strftime("%Y-%m-%d"): float(row.Forecasted_Occupancy)
+            for row in forecast_df.itertuples(index=False)
+        },
+        clarification_count=st.session_state.get("scenario_copilot_clarification_count", 0),
+        conversation_memory=st.session_state.get("scenario_copilot_memory", ScenarioConversationMemory()),
+        horizon_records=scenario_horizon_records,
+        horizon_summary=scenario_horizon_summary,
+    )
+    render_scenario_copilot_chat(scenario_chat_context)
+
     if st.sidebar.button("Run Scenario", type="primary"):
         market_context = {
             "comp_low": override_low if override_market else current_state.get("comp_low"),
@@ -897,34 +1071,4 @@ else:
 
         # Clear logs and show results
         log_placeholder.empty()
-        
-        # Dashboard Metrics
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Final ADR", f"${agent_result['final_adr']:.2f}")
-        c2.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
-        c3.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
-        c4.metric("Pricing Pace", f"{agent_result['pricing_pace_index']}x")
-
-        st.markdown("---")
-        
-        # Strategic Reasoner
-        st.subheader("AI Advisory Briefing")
-        action_label = agent_result.get("ai_recommended_action", agent_result.get("strategy_applied", "Review Before Publishing"))
-        risk_label = agent_result.get("ai_risk_level", "Medium")
-        banner_text = f"{action_label} | Risk: {risk_label}"
-        if action_label == "Accept Optimizer Price":
-            st.success(banner_text)
-        elif action_label in ["Hold For Manual Approval", "Investigate Data Quality"]:
-            st.error(banner_text)
-        else:
-            st.warning(banner_text)
-        # st.success(agent_result['strategic_reasoning'])
-        st.info(escape_streamlit_markdown(normalize_reasoning(agent_result['strategic_reasoning'])))
-        scenario_record = {
-            "current_otb": float(current_state.get("current_otb", 0.0)),
-            "expected_cancellations": float(current_state.get("expected_cancellations", 0.0)),
-            "adjusted_otb": float(current_state.get("adjusted_otb", current_state.get("current_otb", 0.0))),
-        }
-        render_selected_booking_quality(scenario_record)
-        render_technical_trace(agent_result)
-        render_price_trace(agent_result)
+        render_scenario_result(agent_result, scenario_state=current_state)
