@@ -109,6 +109,8 @@ EVENT_TERMS = {
     "ipl",
     "grand prix",
     "banquet",
+    "event",
+    "local intel",
     "person",
     "people",
     "guest",
@@ -257,7 +259,10 @@ def handle_scenario_chat(
     normalized = text.lower()
     if not normalized:
         return ScenarioChatResponse(
-            answer="Ask about the selected date, local intel, market position, pace, or a scenario you want to run.",
+            answer=(
+                "Ask about dates, top/bottom horizon rankings, local intel, forecast audit KPIs, "
+                "or a scenario you want to run."
+            ),
             source_labels=["Scenario Lab"],
         )
 
@@ -331,6 +336,8 @@ def build_scenario_draft(message: str, context: ScenarioChatContext) -> Scenario
                 scenario_state.get("pickup_trend_index"),
                 _safe_float(scenario_state.get("booking_velocity"), 1.0),
             ),
+            target_date=target_date,
+            market_context=_market_context_from_state(scenario_state),
         )
         if local_intel_text
         else {}
@@ -909,6 +916,11 @@ def _run_confirmed_draft(draft: ScenarioDraft, context: ScenarioChatContext) -> 
         if draft.apply_local_intel
         else 0.0
     )
+    local_applied_adr_headroom = (
+        _safe_float(draft.local_intel_estimate.get("adr_headroom"), 0.0)
+        if draft.apply_local_intel
+        else 0.0
+    )
     result = run_agentic_pricing(
         target_date=draft.target_date,
         current_occupancy=_adjusted_occupancy(state),
@@ -927,6 +939,7 @@ def _run_confirmed_draft(draft: ScenarioDraft, context: ScenarioChatContext) -> 
         manual_demand_shock=draft.manual_demand_shock,
         local_intel_estimate=draft.local_intel_estimate,
         local_intel_applied_shock=local_applied_shock,
+        local_intel_applied_adr_headroom=local_applied_adr_headroom,
         raw_otb_occupancy=_raw_occupancy(state),
         adjusted_otb_occupancy=_adjusted_occupancy(state),
         expected_cancellations=_safe_float(state.get("expected_cancellations"), 0.0),
@@ -950,7 +963,8 @@ def _draft_summary(draft: ScenarioDraft) -> str:
         parts.append(
             f"Local intel classified as {estimate.get('classification', 'n/a')} with "
             f"{_safe_float(estimate.get('suggested_shock_pct'), 0.0):+.1f}% suggested demand impact "
-            f"and {estimate.get('confidence', 'n/a')} confidence."
+            f"and {_safe_float(estimate.get('adr_headroom_pct'), 0.0):+.1f}% ADR headroom "
+            f"at {estimate.get('confidence', 'n/a')} confidence."
         )
         if not estimate.get("apply_allowed"):
             parts.append("That local intel is context only under the current guardrails.")
@@ -970,12 +984,26 @@ def _result_summary(result: Dict[str, Any]) -> str:
     local_applied = _safe_float(result.get("local_intel_applied_shock"), 0.0)
     local_estimate = result.get("local_intel_estimate") or {}
     manual_event_text = str(result.get("manual_event_text") or "").strip()
-    if local_applied:
-        intel_text = "local intel was included in priced demand"
-    elif local_estimate or manual_event_text:
+    local_headroom = _safe_float(result.get("local_intel_applied_adr_headroom"), 0.0)
+    has_meaningful_local_intel = bool(
+        manual_event_text
+        or (
+            local_estimate
+            and str(local_estimate.get("classification") or "").lower() not in {"irrelevant", "ambiguous"}
+            and (
+                _safe_float(local_estimate.get("suggested_shock"), 0.0) != 0
+                or _safe_float(local_estimate.get("adr_headroom"), 0.0) != 0
+                or local_estimate.get("evidence")
+                or local_estimate.get("calendar_events")
+            )
+        )
+    )
+    if local_applied or local_headroom:
+        intel_text = "local intel was included in priced demand as a scenario overlay"
+    elif has_meaningful_local_intel:
         intel_text = "local intel was kept as context only"
     else:
-        intel_text = "no local-intel impact was included"
+        intel_text = "no extra demand overlay was included"
     action = result.get("ai_recommended_action") or result.get("strategy_applied", "Review Before Publishing")
     risk = result.get("ai_risk_level", "Medium")
     return (
@@ -993,7 +1021,7 @@ def _confirmation_prompt(draft: ScenarioDraft) -> Optional[str]:
         return None
     changes = []
     if _local_intel_can_affect_price(draft):
-        changes.append("apply the local-intel demand impact")
+        changes.append("apply the local-intel scenario overlay")
     if draft.market_context_override:
         changes.append("use the market override")
     if not changes:
@@ -1546,7 +1574,14 @@ def _local_intel_can_affect_price(draft: ScenarioDraft) -> bool:
 
 
 def _local_estimate_can_affect_price(estimate: Dict[str, Any]) -> bool:
-    return bool(estimate and estimate.get("apply_allowed") and _safe_float(estimate.get("suggested_shock"), 0.0) != 0)
+    return bool(
+        estimate
+        and estimate.get("apply_allowed")
+        and (
+            _safe_float(estimate.get("suggested_shock"), 0.0) != 0
+            or _safe_float(estimate.get("adr_headroom"), 0.0) != 0
+        )
+    )
 
 
 def _copy_draft(draft: ScenarioDraft) -> ScenarioDraft:
@@ -1592,6 +1627,8 @@ def _draft_from_pending_memory(context: ScenarioChatContext) -> Optional[Scenari
                 scenario_state.get("pickup_trend_index"),
                 _safe_float(scenario_state.get("booking_velocity"), 1.0),
             ),
+            target_date=target_date,
+            market_context=_market_context_from_state(scenario_state),
         )
 
     return ScenarioDraft(

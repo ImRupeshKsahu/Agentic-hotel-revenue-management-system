@@ -62,6 +62,8 @@ class AgentState(TypedDict):
     manual_demand_shock: float
     local_intel_suggested_shock: float
     local_intel_applied_shock: float
+    local_intel_suggested_adr_headroom: float
+    local_intel_applied_adr_headroom: float
     total_demand_shock: float
     local_intel_estimate: Dict[str, Any]
     manual_event_text: str
@@ -148,6 +150,25 @@ def _sentence_count(text: str) -> int:
     return len([part for part in re.split(r"[.!?]+", without_decimal_points) if part.strip()])
 
 
+def _has_meaningful_local_intel(state: Dict[str, Any]) -> bool:
+    estimate = state.get("local_intel_estimate") or {}
+    if str(state.get("manual_event_text") or "").strip():
+        return True
+    if not estimate:
+        return False
+    classification = str(estimate.get("classification") or "").lower()
+    return bool(
+        classification
+        and classification not in {"irrelevant", "ambiguous"}
+        and (
+            _safe_float(estimate.get("suggested_shock"), 0.0) != 0
+            or _safe_float(estimate.get("adr_headroom"), 0.0) != 0
+            or estimate.get("evidence")
+            or estimate.get("calendar_events")
+        )
+    )
+
+
 def _needs_manager_rewrite(summary: str, state: AgentState | None = None) -> bool:
     normalized = (summary or "").lower()
     if state:
@@ -211,6 +232,30 @@ def _manager_summary(state: AgentState, action: str) -> str:
         if competitor_price
         else "Competitor pricing is unavailable, so treat this as an internal demand-led recommendation."
     )
+    local_estimate = state.get("local_intel_estimate") or {}
+    local_classification = str(local_estimate.get("classification") or "local intel").strip()
+    local_applied_shock = _safe_float(state.get("local_intel_applied_shock"), 0.0)
+    local_applied_headroom = _safe_float(state.get("local_intel_applied_adr_headroom"), 0.0)
+    local_suggested_shock = _safe_float(local_estimate.get("suggested_shock"), state.get("local_intel_suggested_shock", 0.0))
+    local_suggested_headroom = _safe_float(local_estimate.get("adr_headroom"), state.get("local_intel_suggested_adr_headroom", 0.0))
+    local_text_supplied = _has_meaningful_local_intel(state)
+    local_clause = ""
+    if local_applied_shock or local_applied_headroom:
+        local_clause = (
+            f"Approved {local_classification.lower()} local intel is included "
+            f"({local_applied_shock * 100:+.1f}% demand"
+        )
+        if local_applied_headroom:
+            local_clause += f", {local_applied_headroom * 100:+.1f}% ADR headroom"
+        local_clause += ")"
+    elif local_text_supplied:
+        local_clause = "Local intel was reviewed as context only and was not included in priced demand"
+        if local_suggested_shock or local_suggested_headroom:
+            local_clause += (
+                f" (suggested {local_suggested_shock * 100:+.1f}% demand"
+                + (f", {local_suggested_headroom * 100:+.1f}% ADR headroom" if local_suggested_headroom else "")
+                + ")"
+            )
     action_sentence = {
         "Accept Optimizer Price": "Publish if the remaining-room strategy is unchanged.",
         "Review Before Publishing": "Review before publishing to confirm the ADR fits your positioning and remaining-room strategy.",
@@ -229,9 +274,10 @@ def _manager_summary(state: AgentState, action: str) -> str:
     occupancy_sentence += "."
 
     competitor_clause = competitor_phrase[:-1] if competitor_phrase.endswith(".") else competitor_phrase
+    local_context = f", and {local_clause[0].lower() + local_clause[1:]}" if local_clause else ""
     market_sentence = (
         f"{_pace_phrase(gross_pace_index, pickup_trend_index).capitalize()}, and "
-        f"{competitor_clause[0].lower() + competitor_clause[1:]}; "
+        f"{competitor_clause[0].lower() + competitor_clause[1:]}{local_context}; "
         f"{action_sentence[0].lower() + action_sentence[1:]}"
     )
     return f"{booking_sentence} {occupancy_sentence} {market_sentence}"
@@ -365,6 +411,7 @@ def data_ingestion_node(state: AgentState):
     retained_pace_index = float(date_data.get("retained_pace_index", state.get("retained_pace_index", gross_pace_index)))
     pickup_trend_index = float(date_data.get("pickup_trend_index", state.get("pickup_trend_index", gross_pace_index)))
     pricing_pace_index = float(date_data.get("pricing_pace_index", state.get("pricing_pace_index", velocity)))
+    state_market_context = state.get("market_context") or {}
     raw_market_context = {
         "comp_low": date_data.get("comp_low"),
         "comp_median": date_data.get("comp_median"),
@@ -374,8 +421,10 @@ def data_ingestion_node(state: AgentState):
         "market_regime": date_data.get("market_regime"),
         "market_as_of_timestamp": date_data.get("market_as_of_timestamp"),
     }
+    if any(value is not None for value in state_market_context.values()):
+        raw_market_context = state_market_context
     if not any(value is not None for value in raw_market_context.values()):
-        raw_market_context = state.get("market_context") or {}
+        raw_market_context = {}
     market_context = normalize_market_context(
         raw_market_context,
         date_data.get("competitor_price", state.get("competitor_price", 120.0)),
@@ -411,6 +460,7 @@ def optimizer_node(state: AgentState):
     base_occ = max(state['forecasted_occupancy'], adjusted_otb_occupancy)
     manual_shock = _safe_float(state.get("manual_demand_shock"), _safe_float(state.get("demand_shock"), 0.0))
     local_intel_shock = _safe_float(state.get("local_intel_applied_shock"), 0.0)
+    local_intel_adr_headroom = _safe_float(state.get("local_intel_applied_adr_headroom"), 0.0)
     total_shock = manual_shock + local_intel_shock
     unclamped_occ = base_occ + total_shock
     sim_occ = max(0, min(1, unclamped_occ))
@@ -425,6 +475,7 @@ def optimizer_node(state: AgentState):
         pre_shock_occupancy=base_occ,
         manual_shock=manual_shock,
         local_intel_shock=local_intel_shock,
+        local_intel_adr_headroom_pct=local_intel_adr_headroom,
         booking_velocity=state.get("booking_velocity", 1.0),
         gross_pace_index=state.get("gross_pace_index"),
         retained_pace_index=state.get("retained_pace_index"),
@@ -440,11 +491,14 @@ def optimizer_node(state: AgentState):
     local_estimate = state.get("local_intel_estimate") or {}
     if local_intel_shock != 0:
         flags.append(f"Local intel adjustment applied ({local_intel_shock * 100:+.0f}%)")
-    elif state.get("manual_event_text"):
+    if local_intel_adr_headroom != 0:
+        flags.append(f"Local intel ADR headroom applied ({local_intel_adr_headroom * 100:+.0f}%)")
+    has_meaningful_local_intel = _has_meaningful_local_intel(state)
+    if local_intel_shock == 0 and local_intel_adr_headroom == 0 and has_meaningful_local_intel:
         flags.append("Local intel considered as context only")
     if unclamped_occ != sim_occ:
         flags.append("Total demand adjustment was clamped to keep priced occupancy between 0% and 100%")
-    if state.get("manual_event_text"):
+    if has_meaningful_local_intel:
         flags.append("Local intel context supplied")
     raw_otb_occupancy = _safe_float(state.get("raw_otb_occupancy"), adjusted_otb_occupancy)
     expected_cancellations = _safe_float(state.get("expected_cancellations"), 0.0)
@@ -472,6 +526,7 @@ def optimizer_node(state: AgentState):
         "market_context": breakdown.get("market_context"),
         "compression_score": breakdown.get("compression_score"),
         "allowed_premium_pct": breakdown.get("allowed_premium_pct"),
+        "local_intel_adr_headroom_pct": breakdown.get("local_intel_adr_headroom_pct"),
         "market_position_regime": breakdown.get("market_position_regime"),
         "comp_median_gap_pct": breakdown.get("comp_median_gap_pct"),
         "comp_high_gap_pct": breakdown.get("comp_high_gap_pct"),
@@ -498,6 +553,8 @@ def optimizer_node(state: AgentState):
         "manual_demand_shock": manual_shock,
         "local_intel_suggested_shock": _safe_float(local_estimate.get("suggested_shock"), state.get("local_intel_suggested_shock", 0.0)),
         "local_intel_applied_shock": local_intel_shock,
+        "local_intel_suggested_adr_headroom": _safe_float(local_estimate.get("adr_headroom"), state.get("local_intel_suggested_adr_headroom", 0.0)),
+        "local_intel_applied_adr_headroom": local_intel_adr_headroom,
         "total_demand_shock": total_shock,
     }
 
@@ -566,7 +623,12 @@ def strategist_node(state: AgentState):
                    "manual_demand_shock":state.get('manual_demand_shock', state.get('demand_shock', 0.0))* 100,
                    "local_intel_suggested_shock":state.get('local_intel_suggested_shock', 0.0)* 100,
                    "local_intel_applied_shock":state.get('local_intel_applied_shock', 0.0)* 100,
-                   "local_intel_applied_label":"Yes" if state.get('local_intel_applied_shock', 0.0) != 0 else "No",
+                   "local_intel_applied_label":"Yes" if (
+                       state.get('local_intel_applied_shock', 0.0) != 0
+                       or state.get('local_intel_applied_adr_headroom', 0.0) != 0
+                   ) else "No",
+                   "local_intel_suggested_adr_headroom":state.get('local_intel_suggested_adr_headroom', 0.0)* 100,
+                   "local_intel_applied_adr_headroom":state.get('local_intel_applied_adr_headroom', 0.0)* 100,
                    "total_demand_shock":state.get('total_demand_shock', state.get('demand_shock', 0.0))* 100,
                    "local_intel_estimate": json.dumps(state.get("local_intel_estimate", {})),
                    "manual_event_text": state.get("manual_event_text", ""),
@@ -616,7 +678,7 @@ def strategist_node(state: AgentState):
             review_flags = [str(review_flags)]
         review_flags = _manager_friendly_flags(review_flags)
         owner_summary = ai_decision.get("ai_owner_summary") or ai_decision.get("owner_summary") or "The optimizer price was reviewed against demand, pace, market rate, and safety guardrails."
-        if state.get("manual_event_text") and state.get("local_intel_applied_shock", 0.0) == 0:
+        if _has_meaningful_local_intel(state) and state.get("local_intel_applied_shock", 0.0) == 0 and state.get("local_intel_applied_adr_headroom", 0.0) == 0:
             owner_summary = "Local intel was considered as context only and was not included in the baseline price. " + owner_summary
         if _needs_manager_rewrite(owner_summary, state):
             owner_summary = _manager_summary(state, action)
@@ -697,6 +759,8 @@ def validation_node(state: AgentState):
         "manual_demand_shock": state.get("manual_demand_shock", state.get("demand_shock", 0.0)),
         "local_intel_suggested_shock": state.get("local_intel_suggested_shock", 0.0),
         "local_intel_applied_shock": state.get("local_intel_applied_shock", 0.0),
+        "local_intel_suggested_adr_headroom": state.get("local_intel_suggested_adr_headroom", 0.0),
+        "local_intel_applied_adr_headroom": state.get("local_intel_applied_adr_headroom", 0.0),
         "total_demand_shock": state.get("total_demand_shock", state.get("demand_shock", 0.0)),
     }
 
@@ -739,6 +803,7 @@ def run_agentic_pricing(
     manual_demand_shock=None,
     local_intel_estimate=None,
     local_intel_applied_shock=0.0,
+    local_intel_applied_adr_headroom=None,
     raw_otb_occupancy=None,
     adjusted_otb_occupancy=None,
     expected_cancellations=None,
@@ -747,7 +812,9 @@ def run_agentic_pricing(
     manual_shock = shock if manual_demand_shock is None else manual_demand_shock
     local_estimate = local_intel_estimate or {}
     local_suggested_shock = _safe_float(local_estimate.get("suggested_shock"), 0.0)
+    local_suggested_adr_headroom = _safe_float(local_estimate.get("adr_headroom"), 0.0)
     local_applied_shock = _safe_float(local_intel_applied_shock, 0.0)
+    local_applied_adr_headroom = _safe_float(local_intel_applied_adr_headroom, 0.0)
     total_shock = _safe_float(manual_shock, 0.0) + local_applied_shock
     market_state = market_state or {}
     total_rooms = max(_safe_float(market_state.get("total_rooms"), 0.0), 1.0)
@@ -814,6 +881,8 @@ def run_agentic_pricing(
         "manual_demand_shock": manual_shock,
         "local_intel_suggested_shock": local_suggested_shock,
         "local_intel_applied_shock": local_applied_shock,
+        "local_intel_suggested_adr_headroom": local_suggested_adr_headroom,
+        "local_intel_applied_adr_headroom": local_applied_adr_headroom,
         "total_demand_shock": total_shock,
         "local_intel_estimate": local_estimate,
         "manual_event_text": manual_event_text
@@ -841,6 +910,7 @@ def _append_pricing_decision_log(result: Dict[str, Any]) -> None:
         "selected_adr": result.get("final_adr"),
         "compression_score": breakdown.get("compression_score"),
         "allowed_premium_pct": breakdown.get("allowed_premium_pct"),
+        "local_intel_applied_adr_headroom": result.get("local_intel_applied_adr_headroom"),
         "market_position_regime": breakdown.get("market_position_regime"),
         "selected_candidate": diagnostics.get("selected_candidate"),
         "top_candidates": diagnostics.get("top_candidates"),

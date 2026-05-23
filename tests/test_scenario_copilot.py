@@ -614,7 +614,8 @@ class ScenarioCopilotTests(unittest.TestCase):
         self.assertEqual(captured["manual_event_text"], "")
         self.assertEqual(captured["local_intel_applied_shock"], 0.0)
         self.assertIn("Final ADR", response.answer)
-        self.assertIn("no local-intel impact was included", response.answer)
+        self.assertIn("no extra demand overlay was included", response.answer)
+        self.assertNotIn("local intel", response.answer.lower())
 
     def test_yes_runs_pending_memory_draft_when_ui_prompt_was_text_only(self):
         captured = {}

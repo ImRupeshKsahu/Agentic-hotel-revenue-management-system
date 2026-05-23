@@ -196,6 +196,49 @@ class MarketFeedTests(unittest.TestCase):
         self.assertIn("compression_score", result["optimizer_diagnostics"])
         self.assertIn("allowed_premium_pct", result["optimizer_diagnostics"])
 
+    def test_explicit_market_context_overrides_cached_market_state(self):
+        result = run_agentic_pricing(
+            target_date="2026-06-01",
+            current_occupancy=0.92,
+            forecasted_occupancy=0.95,
+            shock=0.0,
+            market_context={
+                "comp_low": 150.0,
+                "comp_median": 165.0,
+                "comp_high": 180.0,
+                "sample_size": 5,
+                "source_quality": "manual_override",
+                "market_regime": "manual_override",
+            },
+            competitor_price=165.0,
+            market_state={
+                "current_otb": 221,
+                "total_rooms": 237,
+                "adjusted_otb_occupancy": 0.813,
+                "expected_cancellations": 28.0,
+                "competitor_price": 136.36,
+                "comp_low": 129.08,
+                "comp_median": 136.36,
+                "comp_high": 146.05,
+                "sample_size": 5,
+                "source_quality": "simulated",
+                "market_regime": "normal_market",
+                "booking_velocity": 1.25,
+                "gross_pace_index": 1.25,
+                "retained_pace_index": 1.25,
+                "pickup_trend_index": 1.25,
+                "pricing_pace_index": 1.25,
+            },
+            booking_velocity=1.25,
+            record_decision=False,
+        )
+
+        self.assertEqual(result["market_context"]["comp_median"], 165.0)
+        self.assertEqual(result["market_context"]["source_quality"], "manual_override")
+        self.assertAlmostEqual(result["competitor_gap_pct"], ((result["final_adr"] - 165.0) / 165.0) * 100, places=2)
+        self.assertIn("$165.00", result["strategic_reasoning"])
+        self.assertNotIn("$136.36", result["strategic_reasoning"])
+
 
 if __name__ == "__main__":
     unittest.main()

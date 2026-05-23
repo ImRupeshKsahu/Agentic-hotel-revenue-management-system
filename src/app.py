@@ -25,7 +25,7 @@ from copilot_core.scenario_copilot import (
     update_conversation_memory,
 )
 from copilot_core.scenario_llm_copilot import handle_grounded_scenario_chat
-from pricing_core.local_intel import estimate_local_intel_impact
+from pricing_core.local_intel import estimate_local_intel_impact, local_intel_events_for_date
 from copilot_core.manager import (
     build_briefing_payload,
     build_champion_model_audit,
@@ -259,6 +259,33 @@ def adjusted_otb_occupancy(live_entry):
     return float(live_entry.get("current_otb", 0)) / total_rooms
 
 
+def safe_market_price(value, fallback):
+    try:
+        fallback_value = float(fallback)
+    except (TypeError, ValueError):
+        fallback_value = 0.0
+    try:
+        if value is None or pd.isna(value):
+            return fallback_value
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback_value
+
+
+def derive_comp_set_from_median(comp_low, comp_median, comp_high, adjusted_median):
+    baseline_median = max(safe_market_price(comp_median, adjusted_median), 0.01)
+    adjusted_median = max(float(adjusted_median), 0.01)
+    low_ratio = safe_market_price(comp_low, baseline_median) / baseline_median
+    high_ratio = safe_market_price(comp_high, baseline_median) / baseline_median
+    low_ratio = min(max(low_ratio, 0.50), 1.00)
+    high_ratio = max(min(high_ratio, 1.80), 1.00)
+    return {
+        "comp_low": round(adjusted_median * low_ratio, 2),
+        "comp_median": round(adjusted_median, 2),
+        "comp_high": round(adjusted_median * high_ratio, 2),
+    }
+
+
 def humanize_label(value):
     return str(value).replace("_", " ").strip().title()
 
@@ -487,8 +514,8 @@ def reset_scenario_copilot_chat():
         {
             "role": "assistant",
             "content": (
-                "I can answer Scenario Lab questions, prepare local-intel scenarios, "
-                "and run simulations after price-changing inputs are confirmed."
+                "I can answer Scenario Lab questions, rank high/low opportunity dates, explain forecast audit KPIs, "
+                "prepare scenarios, and run simulations after price-changing inputs are confirmed."
             ),
         }
     ]
@@ -500,7 +527,7 @@ def reset_scenario_copilot_chat():
 
 def render_scenario_copilot_chat(context):
     st.subheader("Scenario Copilot Chat")
-    st.caption("Ask about the selected date, local intel, market position, pace, or run a confirmed scenario.")
+    st.caption("Ask about dates, top/bottom horizon rankings, local intel, forecast audit KPIs, or confirmed simulations.")
 
     if "scenario_copilot_messages" not in st.session_state:
         reset_scenario_copilot_chat()
@@ -949,13 +976,26 @@ else:
         },
     )
 
+    current_comp_median = safe_market_price(
+        current_state.get("comp_median", current_state.get("competitor_price")),
+        current_state.get("competitor_price", 120.0),
+    )
+    current_comp_low = safe_market_price(
+        current_state.get("comp_low", current_comp_median),
+        current_comp_median,
+    )
+    current_comp_high = safe_market_price(
+        current_state.get("comp_high", current_comp_median),
+        current_comp_median,
+    )
+
     st.sidebar.info(
         escape_streamlit_markdown(
             f"Current booked rooms: {current_state['current_otb']} | "
             f"Comp set (low / median / high): "
-            f"${current_state.get('comp_low', current_state['competitor_price']):.2f}"
-            f" / ${current_state.get('comp_median', current_state['competitor_price']):.2f}"
-            f" / ${current_state.get('comp_high', current_state['competitor_price']):.2f}"
+            f"${current_comp_low:.2f}"
+            f" / ${current_comp_median:.2f}"
+            f" / ${current_comp_high:.2f}"
         )
     )
     st.sidebar.caption(
@@ -964,37 +1004,137 @@ else:
     )
     with st.sidebar.expander("Scenario-only market override"):
         override_market = st.checkbox("Override market feed for this run", value=False)
-        override_low = st.number_input("Comp low", value=float(current_state.get("comp_low", current_state["competitor_price"])))
-        override_median = st.number_input("Comp median", value=float(current_state.get("comp_median", current_state["competitor_price"])))
-        override_high = st.number_input("Comp high", value=float(current_state.get("comp_high", current_state["competitor_price"])))
-    st.sidebar.subheader("Local Intel")
-    manual_event = st.sidebar.text_input("Enter local event (e.g., '100-person wedding block')")
-
+        st.caption(
+            escape_streamlit_markdown(
+                f"Current comp set: ${current_comp_low:.2f} / ${current_comp_median:.2f} / ${current_comp_high:.2f}"
+            )
+        )
+        median_move_pct = st.slider(
+            "Competitor median move (%)",
+            min_value=-30,
+            max_value=30,
+            value=0,
+            step=5,
+            disabled=not override_market,
+        )
+        override_median = current_comp_median * (1 + (median_move_pct / 100.0))
+        scenario_comp_set = derive_comp_set_from_median(
+            current_comp_low,
+            current_comp_median,
+            current_comp_high,
+            override_median,
+        )
+        st.caption(
+            escape_streamlit_markdown(
+                "Scenario comp set preview: "
+                f"${scenario_comp_set['comp_low']:.2f} / "
+                f"${scenario_comp_set['comp_median']:.2f} / "
+                f"${scenario_comp_set['comp_high']:.2f}"
+            )
+        )
+        st.caption("Low and high are derived from the current spread, so the scenario changes only the market median.")
     target_date_parsed = pd.to_datetime(target_date, format="%Y/%m/%d")
     result = forecast_df.loc[forecast_df["Date"] == target_date_parsed, "Forecasted_Occupancy"]
     forecasted_occ = float(result.iloc[0]) if not result.empty else float(current_state['current_otb'] / BASE_CAPACITY)
     raw_current_occ = float(current_state['current_otb'] / BASE_CAPACITY)
     current_occ = adjusted_otb_occupancy(current_state)
 
-    local_intel_estimate = estimate_local_intel_impact(
-        manual_event,
-        current_occ=current_occ,
-        forecast_occ=forecasted_occ,
-        booking_velocity=float(current_state.get("booking_velocity", 1.0)),
-        retained_pace_index=float(current_state.get("retained_pace_index", current_state.get("booking_velocity", 1.0))),
-        pickup_trend_index=float(current_state.get("pickup_trend_index", current_state.get("booking_velocity", 1.0))),
-    )
+    demand_shock = st.sidebar.slider("Manual Demand Adjustment (%)", -30, 30, 0) / 100.0
 
+    st.sidebar.subheader("Local Intel")
+    seeded_events = local_intel_events_for_date(d_str)
+    event_options = ["No seeded local-intel overlay"]
+    event_options.extend(
+        f"{event['event_name']} ({event['event_category'].replace('_', ' ')})"
+        for event in seeded_events
+    )
+    selected_event_label = st.sidebar.selectbox(
+        "Local Intel Calendar",
+        event_options,
+        index=1 if seeded_events else 0,
+        help="Transparent September 2017 Lisbon event overlay. These events are external scenario inputs, not original booking-dataset fields.",
+    )
+    selected_seeded_event = None
+    if selected_event_label != event_options[0]:
+        selected_seeded_event = seeded_events[event_options.index(selected_event_label) - 1]
+        st.sidebar.caption(
+            escape_streamlit_markdown(
+                f"Overlay source: {selected_seeded_event['area_or_venue']} | "
+                f"{selected_seeded_event['source_quality']} | "
+                "baseline forecast unchanged"
+            )
+        )
+    manual_event = st.sidebar.text_input("Enter local event (e.g., 'music event nearby')")
+    manual_proximity_bucket = None
     if manual_event:
+        proximity_options = {
+            "Infer from text": None,
+            "Nearby / walking distance": "nearby",
+            "City center relevant": "city_center_relevant",
+            "Citywide": "citywide",
+            "Distant or uncertain": "distant_or_uncertain",
+        }
+        proximity_choice = st.sidebar.selectbox(
+            "Manual event proximity",
+            list(proximity_options.keys()),
+            help="Use calendar proximity for seeded events. For manually entered events, infer from text or override the bucket explicitly.",
+        )
+        manual_proximity_bucket = proximity_options[proximity_choice]
+    local_intel_text_for_estimate = manual_event
+    local_intel_target_date = None
+    if selected_seeded_event:
+        local_intel_target_date = d_str
+        if not local_intel_text_for_estimate:
+            local_intel_text_for_estimate = "local intel event overlay"
+
+    has_local_intel_input = bool(manual_event or selected_seeded_event)
+    local_intel_estimate = {}
+    if has_local_intel_input:
+        local_intel_estimate = estimate_local_intel_impact(
+            local_intel_text_for_estimate,
+            current_occ=current_occ,
+            forecast_occ=forecasted_occ,
+            booking_velocity=float(current_state.get("booking_velocity", 1.0)),
+            retained_pace_index=float(current_state.get("retained_pace_index", current_state.get("booking_velocity", 1.0))),
+            pickup_trend_index=float(current_state.get("pickup_trend_index", current_state.get("booking_velocity", 1.0))),
+            target_date=local_intel_target_date,
+            manual_proximity_bucket=manual_proximity_bucket,
+            market_context={
+                "comp_low": current_state.get("comp_low"),
+                "comp_median": current_state.get("comp_median"),
+                "comp_high": current_state.get("comp_high"),
+                "sample_size": current_state.get("sample_size", 1),
+                "source_quality": current_state.get("source_quality"),
+                "market_regime": current_state.get("market_regime"),
+            },
+        )
+
+    if has_local_intel_input:
         st.sidebar.info("Local intel estimated as decision support. It is not applied unless you approve it.")
+        applied_demand_pct = float(local_intel_estimate.get("suggested_shock_pct", 0.0))
+        raw_demand_pct = float(local_intel_estimate.get("raw_occupancy_shock_pct", applied_demand_pct))
+        demand_label = f"{applied_demand_pct:+.1f}%"
+        if local_intel_estimate.get("demand_was_clamped") and raw_demand_pct != applied_demand_pct:
+            demand_label = f"{applied_demand_pct:+.1f}% applied ({raw_demand_pct:+.1f}% raw)"
         st.sidebar.caption(
             f"Type: {local_intel_estimate['classification']} | "
-            f"Suggested impact: {local_intel_estimate['suggested_shock_pct']:+.1f}% | "
+            f"Demand: {demand_label} | "
+            f"ADR headroom: {local_intel_estimate.get('adr_headroom_pct', 0.0):+.1f}% | "
             f"Confidence: {local_intel_estimate['confidence']}"
         )
-        st.sidebar.caption(local_intel_estimate["rationale"])
+        if local_intel_estimate.get("proximity_bucket"):
+            proximity_source_label = str(local_intel_estimate.get("proximity_source", "")).replace("_", " ")
+            st.sidebar.caption(
+                f"Proximity: {local_intel_estimate.get('proximity_label', local_intel_estimate['proximity_bucket'])} "
+                f"({proximity_source_label}, {local_intel_estimate.get('proximity_factor', 1.0):.2f}x)"
+            )
+        if local_intel_estimate.get("demand_clamp_reason"):
+            st.sidebar.caption(local_intel_estimate["demand_clamp_reason"])
+        st.sidebar.caption(local_intel_estimate.get("manager_rationale", local_intel_estimate["rationale"]))
+        if local_intel_estimate.get("evidence"):
+            st.sidebar.caption("Evidence: " + "; ".join(local_intel_estimate["evidence"][:2]))
         apply_local_intel = st.sidebar.checkbox(
-            "Apply local intel estimate to baseline",
+            "Apply local intel scenario overlay",
             value=False,
             disabled=not local_intel_estimate["apply_allowed"],
         )
@@ -1003,10 +1143,12 @@ else:
     else:
         apply_local_intel = False
 
-    demand_shock = st.sidebar.slider("Manual Demand Adjustment (%)", -30, 30, 0) / 100.0
-    local_intel_applied_shock = local_intel_estimate["suggested_shock"] if apply_local_intel else 0.0
+    local_intel_applied_shock = local_intel_estimate.get("suggested_shock", 0.0) if apply_local_intel else 0.0
+    local_intel_applied_adr_headroom = local_intel_estimate.get("adr_headroom", 0.0) if apply_local_intel else 0.0
     total_baseline_shock = demand_shock + local_intel_applied_shock
     st.sidebar.caption(f"Total demand shock included in optimizer: {total_baseline_shock * 100:+.1f}%")
+    if local_intel_applied_adr_headroom:
+        st.sidebar.caption(f"Local-intel ADR headroom included: {local_intel_applied_adr_headroom * 100:+.1f}%")
 
     scenario_horizon_records = build_opportunity_records(forecast_df, live_market)
     scenario_horizon_summary = build_summary_metrics(scenario_horizon_records)
@@ -1030,9 +1172,9 @@ else:
 
     if st.sidebar.button("Run Scenario", type="primary"):
         market_context = {
-            "comp_low": override_low if override_market else current_state.get("comp_low"),
-            "comp_median": override_median if override_market else current_state.get("comp_median"),
-            "comp_high": override_high if override_market else current_state.get("comp_high"),
+            "comp_low": scenario_comp_set["comp_low"] if override_market else current_state.get("comp_low"),
+            "comp_median": scenario_comp_set["comp_median"] if override_market else current_state.get("comp_median"),
+            "comp_high": scenario_comp_set["comp_high"] if override_market else current_state.get("comp_high"),
             "sample_size": current_state.get("sample_size", 1),
             "source_quality": "manual_override" if override_market else current_state.get("source_quality"),
             "market_regime": "manual_override" if override_market else current_state.get("market_regime"),
@@ -1051,7 +1193,7 @@ else:
             current_occupancy=current_occ,
             forecasted_occupancy=float(forecasted_occ),
             shock=demand_shock,
-            manual_event_text=manual_event,
+            manual_event_text=local_intel_text_for_estimate,
             competitor_price=float(market_context.get("comp_median") or current_state.get("competitor_price", 120.0)),
             market_context=market_context,
             booking_velocity=float(current_state.get("booking_velocity", 1.0)),
@@ -1064,6 +1206,7 @@ else:
             manual_demand_shock=demand_shock,
             local_intel_estimate=local_intel_estimate,
             local_intel_applied_shock=local_intel_applied_shock,
+            local_intel_applied_adr_headroom=local_intel_applied_adr_headroom,
             raw_otb_occupancy=raw_current_occ,
             adjusted_otb_occupancy=current_occ,
             expected_cancellations=float(current_state.get("expected_cancellations", 0.0)),

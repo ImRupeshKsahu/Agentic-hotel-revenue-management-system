@@ -9,7 +9,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import pricing_agent
 from config import BASE_PRICE
-from local_intel_estimator import estimate_local_intel_impact
+from local_intel_estimator import (
+    estimate_local_intel_impact,
+    infer_local_intel_proximity,
+    local_intel_events_for_date,
+)
 from pricing_engine import calculate_recommended_price
 from utils.utility_functions import escape_streamlit_markdown
 
@@ -246,6 +250,45 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertEqual(estimate["classification"], "Event")
         self.assertGreater(estimate["suggested_shock"], 0.0)
         self.assertTrue(estimate["apply_allowed"])
+        self.assertEqual(estimate["proximity_bucket"], "nearby")
+
+    def test_manual_proximity_infers_similar_words(self):
+        nearby = infer_local_intel_proximity("concert next door to the hotel")
+        city_center = infer_local_intel_proximity("festival in the city centre")
+        citywide = infer_local_intel_proximity("conference across the city with hotels full")
+        distant = infer_local_intel_proximity("event outside Lisbon in the outskirts")
+
+        self.assertEqual(nearby["bucket"], "nearby")
+        self.assertEqual(city_center["bucket"], "city_center_relevant")
+        self.assertEqual(citywide["bucket"], "citywide")
+        self.assertEqual(distant["bucket"], "distant_or_uncertain")
+
+    def test_manual_proximity_changes_manual_event_impact(self):
+        unspecified = estimate_local_intel_impact(
+            "music festival",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            booking_velocity=1.0,
+        )
+        nearby = estimate_local_intel_impact(
+            "music festival nearby",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            booking_velocity=1.0,
+        )
+        distant_override = estimate_local_intel_impact(
+            "music festival nearby",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            booking_velocity=1.0,
+            manual_proximity_bucket="distant_or_uncertain",
+        )
+
+        self.assertEqual(unspecified["proximity_bucket"], "not_specified")
+        self.assertEqual(nearby["proximity_bucket"], "nearby")
+        self.assertEqual(distant_override["proximity_source"], "manager_override")
+        self.assertGreater(nearby["suggested_shock"], unspecified["suggested_shock"])
+        self.assertLess(distant_override["suggested_shock"], nearby["suggested_shock"])
 
     def test_major_conference_sold_out_is_capped_positive(self):
         estimate = estimate_local_intel_impact(
@@ -257,7 +300,8 @@ class ExplainablePricingTests(unittest.TestCase):
 
         self.assertEqual(estimate["classification"], "Event")
         self.assertEqual(estimate["confidence"], "High")
-        self.assertEqual(estimate["suggested_shock"], 0.15)
+        self.assertEqual(estimate["suggested_shock"], 0.08)
+        self.assertGreater(estimate["adr_headroom"], 0.0)
         self.assertTrue(estimate["apply_allowed"])
 
     def test_recent_pickup_can_strengthen_event_signal(self):
@@ -271,7 +315,7 @@ class ExplainablePricingTests(unittest.TestCase):
         )
 
         self.assertEqual(estimate["classification"], "Event")
-        self.assertEqual(estimate["suggested_shock"], 0.10)
+        self.assertEqual(estimate["suggested_shock"], 0.12)
 
     def test_fifa_world_cup_final_is_event(self):
         estimate = estimate_local_intel_impact(
@@ -281,7 +325,7 @@ class ExplainablePricingTests(unittest.TestCase):
             booking_velocity=1.0,
         )
 
-        self.assertEqual(estimate["classification"], "Event")
+        self.assertEqual(estimate["classification"], "Major Sports Event")
         self.assertEqual(estimate["confidence"], "Medium")
         self.assertEqual(estimate["suggested_shock"], 0.05)
         self.assertTrue(estimate["apply_allowed"])
@@ -296,7 +340,7 @@ class ExplainablePricingTests(unittest.TestCase):
 
         self.assertEqual(estimate["classification"], "Event")
         self.assertEqual(estimate["confidence"], "High")
-        self.assertEqual(estimate["suggested_shock"], 0.15)
+        self.assertEqual(estimate["suggested_shock"], 0.10)
         self.assertTrue(estimate["apply_allowed"])
 
     def test_nearby_hotels_sold_out_due_to_fifa_final_is_not_competitor_only(self):
@@ -322,6 +366,151 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertEqual(estimate["classification"], "Operational Disruption / Ambiguous Demand")
         self.assertLessEqual(abs(estimate["suggested_shock"]), 0.10)
         self.assertTrue(any("Disruption" in item or "disruption" in item for item in estimate["guardrails_applied"]))
+
+    def test_lisbon_seeded_events_load_for_september_horizon(self):
+        events = local_intel_events_for_date("2017-09-12")
+
+        self.assertTrue(events)
+        self.assertEqual(events[0]["event_name"], "Benfica vs CSKA Moscow")
+        self.assertTrue(events[0]["source_url"])
+
+    def test_dates_without_seeded_events_are_context_free(self):
+        self.assertEqual(local_intel_events_for_date("2017-09-30"), [])
+
+    def test_benfica_match_scores_stronger_than_small_business_event(self):
+        match = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            target_date="2017-09-12",
+        )
+        summit = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            target_date="2017-09-26",
+        )
+
+        self.assertEqual(match["source"], "seeded_lisbon_calendar")
+        self.assertEqual(match["classification"], "Major Sports Event")
+        self.assertGreater(match["suggested_shock"], summit["suggested_shock"])
+        self.assertGreater(match["adr_headroom"], summit["adr_headroom"])
+
+    def test_manual_event_combines_with_seeded_calendar_event_as_cluster(self):
+        calendar_only = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            target_date="2017-09-12",
+        )
+        cluster = estimate_local_intel_impact(
+            "music event nearby",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            target_date="2017-09-12",
+        )
+
+        self.assertEqual(cluster["classification"], "Local Event Cluster")
+        self.assertEqual(cluster["source"], "seeded_calendar_plus_manual_intel")
+        self.assertGreater(cluster["suggested_shock"], calendar_only["suggested_shock"])
+        self.assertGreaterEqual(cluster["adr_headroom"], calendar_only["adr_headroom"])
+        self.assertTrue(any("combined as an event cluster" in item for item in cluster["guardrails_applied"]))
+        self.assertTrue(any("Benfica" in item for item in cluster["evidence"]))
+        self.assertTrue(any("music event nearby" in item for item in cluster["evidence"]))
+
+    def test_lisbon_cultural_cluster_has_medium_city_center_impact(self):
+        estimate = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.50,
+            forecast_occ=0.70,
+            target_date="2017-09-15",
+        )
+
+        self.assertIn(estimate["classification"], {"Cultural / Festival Cluster", "Local Event Cluster"})
+        self.assertEqual(estimate["confidence"], "Medium")
+        self.assertGreaterEqual(estimate["suggested_shock"], 0.04)
+        self.assertGreater(estimate["adr_headroom"], 0.0)
+
+    def test_seeded_event_shock_clamps_when_forecast_is_near_full(self):
+        estimate = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.90,
+            forecast_occ=0.95,
+            target_date="2017-09-12",
+        )
+
+        self.assertEqual(estimate["suggested_shock"], 0.05)
+        self.assertTrue(any("100%" in item for item in estimate["guardrails_applied"]))
+
+    def test_seeded_business_event_preserves_raw_demand_when_clamped(self):
+        estimate = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=1.00,
+            forecast_occ=0.95,
+            target_date="2017-09-26",
+        )
+
+        self.assertEqual(estimate["classification"], "Business Event")
+        self.assertEqual(estimate["suggested_shock"], 0.0)
+        self.assertGreater(estimate["raw_occupancy_shock"], 0.0)
+        self.assertAlmostEqual(estimate["raw_occupancy_shock_pct"], 2.7)
+        self.assertTrue(estimate["demand_was_clamped"])
+        self.assertIn("occupancy room", estimate["demand_clamp_reason"])
+        self.assertGreater(estimate["adr_headroom"], 0.0)
+
+    def test_approved_local_intel_headroom_changes_pricing_policy(self):
+        estimate = estimate_local_intel_impact(
+            "local intel event overlay",
+            current_occ=0.70,
+            forecast_occ=0.75,
+            target_date="2017-09-12",
+            market_context={
+                "comp_low": 130.0,
+                "comp_median": 150.0,
+                "comp_high": 170.0,
+                "sample_size": 5,
+                "source_quality": "simulated",
+                "market_regime": "normal_market",
+            },
+        )
+
+        _, _, baseline = calculate_recommended_price(
+            occupancy=0.75,
+            day_name="Tuesday",
+            target_date="2017-09-12",
+            competitor_price=150.0,
+            market_context={
+                "comp_low": 130.0,
+                "comp_median": 150.0,
+                "comp_high": 170.0,
+                "sample_size": 5,
+                "source_quality": "simulated",
+                "market_regime": "normal_market",
+            },
+            return_breakdown=True,
+        )
+        _, _, applied = calculate_recommended_price(
+            occupancy=0.85,
+            day_name="Tuesday",
+            target_date="2017-09-12",
+            competitor_price=150.0,
+            market_context={
+                "comp_low": 130.0,
+                "comp_median": 150.0,
+                "comp_high": 170.0,
+                "sample_size": 5,
+                "source_quality": "simulated",
+                "market_regime": "normal_market",
+            },
+            return_breakdown=True,
+            pre_shock_occupancy=0.75,
+            local_intel_shock=estimate["suggested_shock"],
+            local_intel_adr_headroom_pct=estimate["adr_headroom"],
+            manual_event_text="local intel event overlay",
+        )
+
+        self.assertGreaterEqual(applied["allowed_premium_pct"], estimate["adr_headroom"])
+        self.assertGreater(applied["allowed_premium_pct"], baseline["allowed_premium_pct"])
 
     def test_local_intel_changes_baseline_only_when_applied(self):
         pricing_agent.client = SimpleNamespace(
@@ -392,6 +581,84 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertIn("likely retained occupancy is 65.0%", summary)
         self.assertIn("forecast occupancy is 93.2%", summary)
         self.assertNotIn("already 93.2% booked", summary)
+
+    def test_manager_summary_mentions_applied_local_intel_overlay(self):
+        summary = pricing_agent._manager_summary(
+            {
+                "optimized_price": 135.0,
+                "raw_otb_occupancy": 0.717,
+                "adjusted_otb_occupancy": 0.664,
+                "current_occupancy": 0.664,
+                "forecasted_occupancy": 0.917,
+                "gross_pace_index": 1.0,
+                "pickup_trend_index": 1.25,
+                "competitor_price": 135.67,
+                "market_context": {"comp_median": 135.67},
+                "manual_event_text": "music event nearby",
+                "local_intel_estimate": {
+                    "classification": "Local Event Cluster",
+                    "suggested_shock": 0.08,
+                    "adr_headroom": 0.12,
+                },
+                "local_intel_applied_shock": 0.08,
+                "local_intel_applied_adr_headroom": 0.12,
+            },
+            "Review Before Publishing",
+        )
+
+        self.assertIn("local intel is included", summary)
+        self.assertIn("+8.0% demand", summary)
+        self.assertIn("+12.0% ADR headroom", summary)
+
+    def test_manager_summary_mentions_context_only_local_intel(self):
+        summary = pricing_agent._manager_summary(
+            {
+                "optimized_price": 135.0,
+                "raw_otb_occupancy": 0.717,
+                "adjusted_otb_occupancy": 0.664,
+                "current_occupancy": 0.664,
+                "forecasted_occupancy": 0.917,
+                "gross_pace_index": 1.0,
+                "pickup_trend_index": 1.25,
+                "competitor_price": 135.67,
+                "market_context": {"comp_median": 135.67},
+                "manual_event_text": "music event nearby",
+                "local_intel_estimate": {
+                    "classification": "Event",
+                    "suggested_shock": 0.05,
+                    "adr_headroom": 0.04,
+                },
+                "local_intel_applied_shock": 0.0,
+                "local_intel_applied_adr_headroom": 0.0,
+            },
+            "Review Before Publishing",
+        )
+
+        self.assertIn("local intel was reviewed as context only", summary)
+        self.assertIn("not included in priced demand", summary)
+
+    def test_manager_summary_omits_local_intel_when_none_supplied(self):
+        summary = pricing_agent._manager_summary(
+            {
+                "optimized_price": 135.0,
+                "raw_otb_occupancy": 0.717,
+                "adjusted_otb_occupancy": 0.664,
+                "current_occupancy": 0.664,
+                "forecasted_occupancy": 0.917,
+                "gross_pace_index": 1.0,
+                "pickup_trend_index": 1.25,
+                "competitor_price": 135.67,
+                "market_context": {"comp_median": 135.67},
+                "manual_event_text": "",
+                "local_intel_estimate": {},
+                "local_intel_applied_shock": 0.0,
+                "local_intel_applied_adr_headroom": 0.0,
+            },
+            "Review Before Publishing",
+        )
+
+        self.assertNotIn("local intel", summary.lower())
+        self.assertNotIn("context only", summary.lower())
 
     def test_sep_1_regression_uses_sold_out_floor_and_clear_summary(self):
         self._original_resolve_api_key = pricing_agent._resolve_api_key

@@ -25,6 +25,8 @@
     - Local Intel Suggested Demand Impact: {local_intel_suggested_shock:.1f}%
     - Local Intel Included In Optimizer: {local_intel_applied_label}
     - Local Intel Demand Impact Included: {local_intel_applied_shock:.1f}%
+    - Local Intel Suggested ADR Headroom: {local_intel_suggested_adr_headroom:.1f}%
+    - Local Intel ADR Headroom Included: {local_intel_applied_adr_headroom:.1f}%
     - Total Demand Shock Included In Optimizer: {total_demand_shock:.1f}%
     - Local Intel Estimate: {local_intel_estimate}
     - Manual Event Text: {manual_event_text}

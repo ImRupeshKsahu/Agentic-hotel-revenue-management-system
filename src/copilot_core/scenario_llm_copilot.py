@@ -692,6 +692,8 @@ def _apply_memory_to_followup_response(
                 scenario_state.get("pickup_trend_index"),
                 _safe_float(scenario_state.get("booking_velocity"), 1.0),
             ),
+            target_date=response.draft.target_date,
+            market_context=_market_context_from_state(scenario_state),
         )
         response.draft.confirmation_required = True
         response.confirmation_prompt = _confirmation_prompt_from_memory(response.confirmation_prompt, "reuse the previous local intel")

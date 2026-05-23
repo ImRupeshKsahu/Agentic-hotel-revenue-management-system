@@ -285,6 +285,7 @@ def _compression_profile(
     raw_otb_occupancy,
     adjusted_otb_occupancy,
     local_intel_shock,
+    local_intel_adr_headroom_pct,
     lead_time_days,
     market_regime,
 ):
@@ -333,6 +334,10 @@ def _compression_profile(
         allowed_premium_pct = 0.02
         regime = "soft_market"
 
+    local_headroom = _clamp01(local_intel_adr_headroom_pct)
+    if local_headroom > 0:
+        allowed_premium_pct = max(allowed_premium_pct, min(0.20, local_headroom))
+
     if market_regime == "market_wide_sellout":
         allowed_premium_pct = min(0.20, allowed_premium_pct + 0.02)
     elif market_regime == "event_compression":
@@ -344,6 +349,7 @@ def _compression_profile(
         "market_position_regime": regime,
         "retention_ratio": round(retention_ratio, 4),
         "lead_time_days": int(lead_time_days),
+        "local_intel_adr_headroom_pct": round(local_headroom, 4),
     }
 
 
@@ -382,6 +388,7 @@ def _manual_review_flags(
     pickup_trend_index,
     manual_event_text,
     local_intel_shock,
+    local_intel_adr_headroom_pct=0.0,
     *,
     sold_out=False,
     raw_otb_occupancy=None,
@@ -415,7 +422,7 @@ def _manual_review_flags(
             "verify cancellation assumptions and remaining-room strategy before publishing."
         )
 
-    if manual_event_text and local_intel_shock:
+    if manual_event_text and (local_intel_shock or local_intel_adr_headroom_pct):
         flags.append("Local intel was applied to priced demand; confirm the event impact is still appropriate before publishing.")
     elif manual_event_text:
         flags.append("Local intel was supplied as context only and was not applied to priced demand.")
@@ -433,6 +440,7 @@ def calculate_recommended_price(
     pre_shock_occupancy=None,
     manual_shock=0.0,
     local_intel_shock=0.0,
+    local_intel_adr_headroom_pct=0.0,
     booking_velocity=1.0,
     gross_pace_index=None,
     retained_pace_index=None,
@@ -473,6 +481,7 @@ def calculate_recommended_price(
 
     manual_shock = float(manual_shock or 0.0)
     local_intel_shock = float(local_intel_shock or 0.0)
+    local_intel_adr_headroom_pct = max(0.0, min(0.20, float(local_intel_adr_headroom_pct or 0.0)))
     if pre_shock_occupancy is not None and manual_shock == 0 and local_intel_shock == 0 and occupancy != organic_occupancy:
         manual_shock = occupancy - organic_occupancy
 
@@ -493,6 +502,7 @@ def calculate_recommended_price(
         raw_otb_occupancy,
         adjusted_otb_occupancy,
         local_intel_shock,
+        local_intel_adr_headroom_pct,
         lead_time_days,
         market_context.get("market_regime"),
     )
@@ -587,6 +597,11 @@ def calculate_recommended_price(
         (
             f"Comp-set median ${competitor_price:.2f} and high ${market_context['comp_high']:.2f} were used as soft demand signals; "
             f"{compression['market_position_regime'].replace('_', ' ')} allows up to {compression['allowed_premium_pct'] * 100:.0f}% premium over median."
+            + (
+                f" Approved local intel contributed {local_intel_adr_headroom_pct * 100:.0f}% ADR headroom."
+                if local_intel_adr_headroom_pct > 0
+                else ""
+            )
             if competitor_price is not None
             else "No finite competitor price was available."
         ),
@@ -640,6 +655,7 @@ def calculate_recommended_price(
         pickup_trend_index,
         manual_event_text,
         local_intel_shock,
+        local_intel_adr_headroom_pct,
         sold_out=sold_out,
         raw_otb_occupancy=raw_otb_occupancy,
         adjusted_otb_occupancy=adjusted_otb_occupancy,
@@ -669,6 +685,7 @@ def calculate_recommended_price(
         "demand_anchor": round(demand_anchor, 4),
         "manual_shock": round(manual_shock, 4),
         "local_intel_shock": round(local_intel_shock, 4),
+        "local_intel_adr_headroom_pct": round(local_intel_adr_headroom_pct, 4),
         "booking_velocity": round(booking_velocity, 4),
         "gross_pace_index": round(gross_pace_index, 4),
         "retained_pace_index": round(retained_pace_index, 4),
