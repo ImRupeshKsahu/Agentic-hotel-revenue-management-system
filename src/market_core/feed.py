@@ -4,7 +4,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
-from config import DATA_END_DATE, LIVE_COMPETITOR_MARKET_PATH
+from project_core.config import DATA_END_DATE, LIVE_COMPETITOR_MARKET_PATH
 
 
 MARKET_SNAPSHOT_COLUMNS = [

@@ -8,10 +8,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from market_feed import build_simulated_market_snapshot, simulate_competitor_market_event
-from pms_snapshot import export_live_market_state
-from pricing_agent import run_agentic_pricing
-from pricing_engine import calculate_recommended_price
+from market_core.feed import build_simulated_market_snapshot, simulate_competitor_market_event
+from pms_core.snapshot import export_live_market_state
+from copilot_core.pricing_agent import run_agentic_pricing
+from pricing_core.engine import calculate_recommended_price
 
 
 class MarketFeedTests(unittest.TestCase):

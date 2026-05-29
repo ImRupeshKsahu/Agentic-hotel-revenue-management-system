@@ -35,11 +35,13 @@ streamlit run src/app.py
 
 ```powershell
 # Our PMS / booking stream
-python src/simulate_live_market.py --once
+$env:PYTHONPATH = "src"
+python -m pms_core.live_ledger --once
 
 # External competitor-market stream
-python src/simulate_competitor_market.py --init
-python src/simulate_competitor_market.py --once
+$env:PYTHONPATH = "src"
+python -m market_core.competitor_simulator --init
+python -m market_core.competitor_simulator --once
 ```
 
 ## Test
@@ -57,3 +59,4 @@ python -m unittest discover -s tests
 ## Project documentation
 
 - Pricing architecture and presentation notes: `docs/pricing_optimization_summary.md`
+- Occupancy forecasting and backtesting summary: `docs/occupancy_forecast_process_summary.md`

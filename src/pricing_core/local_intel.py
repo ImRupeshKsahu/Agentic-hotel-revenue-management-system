@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-from config import LOCAL_INTEL_CALENDAR_PATH
+from project_core.config import LOCAL_INTEL_CALENDAR_PATH
 
 
 MAX_DEFAULT_SHOCK = 0.10

@@ -4,7 +4,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-from config import BASE_CAPACITY, CHAT_MODEL
+from project_core.config import BASE_CAPACITY, CHAT_MODEL
 from copilot_core.pricing_agent import _get_client, _resolve_api_key
 from pricing_core.engine import calculate_recommended_price
 

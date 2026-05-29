@@ -1,7 +1,7 @@
 import pandas as pd
 import pickle
 import os
-from config import MODEL_PATH, BASE_CAPACITY, DATA_PATH
+from project_core.config import MODEL_PATH, BASE_CAPACITY, DATA_PATH
 from pricing_core.engine import calculate_recommended_price
 
 class ScenarioEngine:

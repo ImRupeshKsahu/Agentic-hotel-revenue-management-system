@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import timedelta
-from config import (
+from project_core.config import (
     BACKTEST_AUDIT_SUMMARY_PATH,
     BASE_PRICE,
     BASE_CAPACITY,

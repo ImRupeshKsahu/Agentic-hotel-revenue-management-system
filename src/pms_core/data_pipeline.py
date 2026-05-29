@@ -4,7 +4,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, RAW_BOOKINGS_PATH
+from project_core.config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, RAW_BOOKINGS_PATH
 
 
 MONTH_MAP = {

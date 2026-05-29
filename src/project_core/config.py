@@ -6,8 +6,8 @@ try:
 except ImportError:
     load_dotenv = None
 
-# Base Directory (The root)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Base Directory (The repo root)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if load_dotenv:
     load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -58,7 +58,7 @@ BACKTEST_SCENARIO_LAGS = [10, 14, 21, 30, 45, 60]
 BACKTEST_CADENCE_DAYS = 7
 FORECAST_HYPERPARAM_TRIALS = 5
 FORECAST_HYPERPARAM_TUNING_RECENT_FOLDS = 5
-STRATEGIST_PROMPT_PATH = os.path.join(BASE_DIR,"src", "prompts", "strategist.txt")
+STRATEGIST_PROMPT_PATH = os.path.join(BASE_DIR, "src", "prompts", "strategist.txt")
 NEW_DATA_PATH = os.path.join(BASE_DIR, "data", "hotel_bookings.csv")
 LIVE_DATA_PATH = os.path.join(BASE_DIR, "data", "live_hotel_bookings.csv")
 

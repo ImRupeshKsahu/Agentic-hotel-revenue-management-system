@@ -7,14 +7,14 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import pricing_agent
-from config import BASE_PRICE
-from local_intel_estimator import (
+import copilot_core.pricing_agent as pricing_agent
+from project_core.config import BASE_PRICE
+from pricing_core.local_intel import (
     estimate_local_intel_impact,
     infer_local_intel_proximity,
     local_intel_events_for_date,
 )
-from pricing_engine import calculate_recommended_price
+from pricing_core.engine import calculate_recommended_price
 from utils.utility_functions import escape_streamlit_markdown
 
 

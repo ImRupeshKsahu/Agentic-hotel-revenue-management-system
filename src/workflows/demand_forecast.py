@@ -3,7 +3,7 @@ import os
 
 import pandas as pd
 
-from config import (
+from project_core.config import (
     BACKTEST_AUDIT_FOLD_METRICS_PATH,
     BACKTEST_AUDIT_INTERVAL_COVERAGE_PATH,
     BACKTEST_AUDIT_LAG_METRICS_PATH,
@@ -36,7 +36,7 @@ from config import (
     RAW_BOOKINGS_PATH,
 )
 from pms_core.data_pipeline import refresh_daily_hotel_data
-from forecasting import ForecastEngine, load_champion
+from forecasting_core.api import ForecastEngine, load_champion
 from forecasting_core.hyperparameter_tuning import (
     HyperparameterTuningConfig,
     load_tuning_payload,

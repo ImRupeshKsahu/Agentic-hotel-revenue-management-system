@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from config import API_KEY, CHAT_MODEL
+from project_core.config import API_KEY, CHAT_MODEL
 
 class LLMExplainer:
     def __init__(self):

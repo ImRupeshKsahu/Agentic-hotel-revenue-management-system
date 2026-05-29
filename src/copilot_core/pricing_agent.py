@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
 from pricing_core.engine import calculate_recommended_price, normalize_market_context
-from config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE, PRICING_DECISION_LOG_PATH
+from project_core.config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE, PRICING_DECISION_LOG_PATH
 from openai import OpenAI
 from utils.utility_functions import load_prompt
 import httpx

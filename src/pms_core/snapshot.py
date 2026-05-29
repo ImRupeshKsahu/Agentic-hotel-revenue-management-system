@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from pricing_core.cancellation import estimate_cancellation_probabilities
-from config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, RAW_BOOKINGS_PATH
+from project_core.config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, RAW_BOOKINGS_PATH
 from pms_core.data_pipeline import normalize_bookings
 
 PACE_SMOOTHING_ROOMS = 10.0

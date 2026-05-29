@@ -9,7 +9,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from forecasting import (
+from forecasting_core.api import (
     _aggregate_fold_metrics,
     _audit_status,
     _build_chain_training,
@@ -30,7 +30,7 @@ from forecasting import (
     save_champion,
     select_champion,
 )
-import forecasting
+import forecasting_core.api as forecasting
 import forecasting_core.legacy as forecasting_impl
 from forecasting_core.algorithms import ForecastPrediction, algorithm_for_model
 from forecasting_core.boruta_selector import BorutaFeatureSelector

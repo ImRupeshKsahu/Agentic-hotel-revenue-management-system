@@ -7,8 +7,8 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-from config import FORECAST_FORCE_KEEP_FEATURES
-from feature_engineering import FeatureEngineer
+from project_core.config import FORECAST_FORCE_KEEP_FEATURES
+from forecasting_core.feature_engineering import FeatureEngineer
 from forecasting_core.hyperparameter_tuning import (
     ForecastHyperparameterTuner,
     HyperparameterTuningConfig,

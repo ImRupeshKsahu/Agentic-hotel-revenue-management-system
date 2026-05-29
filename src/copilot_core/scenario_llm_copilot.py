@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from config import BASE_DIR, CHAT_MODEL
+from project_core.config import BASE_DIR, CHAT_MODEL
 from copilot_core.pricing_agent import _get_client, _resolve_api_key
 from pricing_core.local_intel import estimate_local_intel_impact
 from copilot_core.scenario_copilot import (

@@ -2,7 +2,7 @@ import argparse
 
 import pandas as pd
 
-from config import BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, RAW_BOOKINGS_PATH
+from project_core.config import BASE_CAPACITY, DATA_END_DATE, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, RAW_BOOKINGS_PATH
 from market_core.feed import ensure_competitor_market
 from pms_core.snapshot import calculate_otb_snapshot, export_live_market_state, load_booking_ledger
 from pms_core.live_ledger import initialize_live_ledger

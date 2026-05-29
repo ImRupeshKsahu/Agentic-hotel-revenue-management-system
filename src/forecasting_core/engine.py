@@ -5,7 +5,7 @@ from typing import Optional
 
 import pandas as pd
 
-from feature_engineering import FeatureEngineer
+from forecasting_core.feature_engineering import FeatureEngineer
 from forecasting_core.algorithms import algorithm_for_model
 from forecasting_core.artifacts import ArtifactStore, ForecastChampion
 from forecasting_core.backtesting import ForecastBacktester

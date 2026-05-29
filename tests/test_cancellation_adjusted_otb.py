@@ -7,10 +7,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from cancellation_risk import estimate_cancellation_probabilities
-from pms_snapshot import calculate_otb_snapshot
-from pricing_agent import optimizer_node
-from pricing_engine import calculate_recommended_price
+from pricing_core.cancellation import estimate_cancellation_probabilities
+from pms_core.snapshot import calculate_otb_snapshot
+from copilot_core.pricing_agent import optimizer_node
+from pricing_core.engine import calculate_recommended_price
 
 
 def booking(

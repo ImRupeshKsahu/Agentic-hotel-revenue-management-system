@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 import numpy as np
 import pandas as pd
 
-from config import (
+from project_core.config import (
     FORECAST_BASELINE_LAGS,
     FORECAST_BASELINE_ROLLING_STATS,
     FORECAST_BASELINE_TREND_FEATURES,

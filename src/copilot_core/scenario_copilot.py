@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from config import (
+from project_core.config import (
     BASE_CAPACITY,
     BACKTEST_AUDIT_SUMMARY_PATH,
     DATA_END_DATE,

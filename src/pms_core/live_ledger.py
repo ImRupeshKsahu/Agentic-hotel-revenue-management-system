@@ -5,7 +5,7 @@ import time
 
 import pandas as pd
 
-from config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, LIVE_MARKET_STATE_PATH, OTB_SNAPSHOT_PATH, RAW_BOOKINGS_PATH
+from project_core.config import BASE_CAPACITY, DATA_END_DATE, DEFAULT_HOTEL, FORECAST_OUTPUT_PATH, LIVE_DATA_PATH, LIVE_MARKET_STATE_PATH, OTB_SNAPSHOT_PATH, RAW_BOOKINGS_PATH
 from pms_core.data_pipeline import normalize_bookings
 from market_core.feed import ensure_competitor_market
 from pms_core.snapshot import calculate_otb_snapshot, export_live_market_state

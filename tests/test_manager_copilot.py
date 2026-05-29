@@ -9,7 +9,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import manager_copilot
+import copilot_core.manager as manager_copilot
 
 
 class ManagerCopilotTests(unittest.TestCase):

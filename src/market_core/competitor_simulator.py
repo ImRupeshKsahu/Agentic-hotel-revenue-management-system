@@ -3,7 +3,7 @@ import os
 
 import pandas as pd
 
-from config import DATA_END_DATE, FORECAST_HORIZON_DAYS, FORECAST_OUTPUT_PATH, LIVE_COMPETITOR_MARKET_PATH, OTB_SNAPSHOT_PATH
+from project_core.config import DATA_END_DATE, FORECAST_HORIZON_DAYS, FORECAST_OUTPUT_PATH, LIVE_COMPETITOR_MARKET_PATH, OTB_SNAPSHOT_PATH
 from market_core.feed import initialize_competitor_market, simulate_competitor_market_event
 from pms_core.snapshot import export_live_market_state
 

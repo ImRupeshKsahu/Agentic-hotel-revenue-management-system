@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from config import (
+from project_core.config import (
     DATA_PATH,
     FORECAST_OUTPUT_PATH,
     MIN_PRICE,
