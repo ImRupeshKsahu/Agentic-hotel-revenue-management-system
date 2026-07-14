@@ -117,16 +117,92 @@ The estimator then learns smoothed cancellation rates using:
 - distribution channel
 - customer type
 
+These fields are used as **peer-group matching dimensions**, not as opaque model weights.
+
+For an active future booking, the system first tries to match it to a historical cohort such as:
+
+```text
+remaining_days_band
++ lead_time_band
++ market_segment
++ distribution_channel
++ customer_type
+```
+
+Example:
+
+```text
+8-14 days to arrival
++ 31-90 day original lead time
++ Online TA market segment
++ TA/TO distribution channel
++ Transient customer type
+```
+
+The cancellation probability is the historical share of comparable bookings that were still active at the same remaining-days point and then cancelled before arrival.
+
+To avoid overreacting to small samples, the cohort rate is smoothed toward the global hotel-wide future-cancellation rate:
+
+```text
+smoothed_rate =
+(cancelled_count + smoothing * global_rate)
+/
+(total_count + smoothing)
+```
+
+That `smoothed_rate` becomes the booking-level `cancellation_probability` for the active booking.
+
+With the default configuration:
+
+```text
+minimum supported cohort size = 30 historical records
+smoothing = 10.0
+```
+
+The smoothing behaves like adding about 10 units of global prior evidence to the peer-group estimate. This keeps very small peer groups from producing extreme cancellation probabilities.
+
+Example:
+
+```text
+Peer group:
+Online TA, TA/TO channel, Transient customer, 8-14 days before arrival
+
+total_count = 100 comparable historical bookings
+cancelled_count = 20 bookings cancelled after that point
+global_rate = 0.15
+smoothing = 10.0
+
+cancellation_probability =
+(20 + 10.0 * 0.15) / (100 + 10.0)
+= 21.5 / 110
+= 0.195
+```
+
+So the active booking receives:
+
+```text
+cancellation_probability = 19.5%
+expected_retained_rooms = 80.5%
+```
+
+In plain interview language:
+
+> For each booking, we do not predict cancellation independently with a black-box model. We match it to a comparable historical cohort and assign the smoothed future-cancellation rate of that cohort as the booking's cancellation probability.
+
+If the detailed peer group is not large enough, the model backs off to broader groups.
+
 ### 4.4 Fallback remains interpretable
 
 If a very specific combination has too little support, the system falls back gradually:
 
-1. detailed bucket with all dimensions,
-2. broader bucket with fewer dimensions,
-3. remaining-days-band hotel-wide rate,
-4. global hotel-wide rate if needed.
+1. remaining days + lead time + market segment + distribution channel + customer type,
+2. remaining days + lead time + market segment + distribution channel,
+3. remaining days + lead time + market segment,
+4. remaining days + lead time,
+5. remaining days only,
+6. global hotel-wide future-cancellation rate if needed.
 
-This preserves stability while keeping the logic inspectable.
+This preserves stability while keeping the logic inspectable. In practical terms, `market_segment`, `distribution_channel`, and `customer_type` make the estimate more tailored when there is enough historical evidence, but the model never depends on a tiny, unreliable slice of data.
 
 ---
 
@@ -365,7 +441,6 @@ Use the `2017-09-01` example:
 
 ---
 
-## 14. Talking Points for a Lead Data Scientist
 
 ### 30-second version
 

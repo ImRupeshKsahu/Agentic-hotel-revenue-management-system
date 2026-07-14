@@ -191,7 +191,7 @@ class ScenarioCopilotTests(unittest.TestCase):
         self.assertIn("30-day Scenario Lab ranking", response.source_labels)
         self.assertNotIn("For 2017-09-12", response.answer)
 
-    def test_explicit_highest_revenue_upside_defaults_to_one_and_ignores_prior_limit(self):
+    def test_explicit_highest_modeled_lift_defaults_to_one_and_ignores_prior_limit(self):
         context = self._context()
         context.conversation_memory = ScenarioConversationMemory(
             last_horizon_rank_request={
@@ -202,19 +202,28 @@ class ScenarioCopilotTests(unittest.TestCase):
             }
         )
 
-        response = handle_scenario_chat("what is highest upside in revenue based on recommended ADR?", context)
+        response = handle_scenario_chat("what is highest modeled lift vs booked ADR?", context)
 
-        self.assertIn("Top 1 dates by upside versus booked ADR", response.answer)
+        self.assertIn("Top 1 dates by modeled lift versus booked ADR", response.answer)
         self.assertIn("\n1. 2017-09-11: $700.00", response.answer)
         self.assertNotIn("\n2.", response.answer)
         self.assertNotIn("Used the prior ranking clarification", " ".join(response.assumptions))
 
-    def test_top_four_revenue_upside_uses_explicit_word_count_and_newline_list(self):
-        response = handle_scenario_chat("show top two highest revenue upside dates", self._context())
+    def test_top_two_revenue_opportunity_uses_remaining_room_metric(self):
+        context = self._context()
+        for record in context.horizon_records:
+            record["remaining_room_opportunity"] = {
+                "2017-09-11": 450.0,
+                "2017-09-12": 100.0,
+                "2017-09-19": 600.0,
+            }[record["date"]]
+            record["sellable_rooms"] = 10.0
+            record["pricing_mode"] = "remaining_room_optimization"
+        response = handle_scenario_chat("show top two highest revenue opportunity dates", context)
 
-        self.assertIn("Top 2 dates by upside versus booked ADR", response.answer)
-        self.assertIn("\n1. 2017-09-11: $700.00", response.answer)
-        self.assertIn("\n2. 2017-09-19: $500.00", response.answer)
+        self.assertIn("Top 2 dates by remaining-room opportunity", response.answer)
+        self.assertIn("\n1. 2017-09-19: $600.00", response.answer)
+        self.assertIn("\n2. 2017-09-11: $450.00", response.answer)
         self.assertNotIn("\n3.", response.answer)
 
     def test_explicit_least_projected_occupancy_overrides_prior_top_ten_memory(self):

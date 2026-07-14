@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from pricing_core.cancellation import estimate_cancellation_probabilities
 from pms_core.snapshot import calculate_otb_snapshot
 from copilot_core.pricing_agent import optimizer_node
-from pricing_core.engine import calculate_recommended_price
+from pricing_core.engine import _candidate_prices, _select_candidate, calculate_recommended_price
 
 
 def booking(
@@ -277,6 +277,80 @@ class CancellationAdjustedOTBTests(unittest.TestCase):
 
         self.assertEqual(adjusted_price, baseline_price)
         self.assertEqual(breakdown["pricing_occupancy"], 0.82)
+
+    def test_fully_retained_inventory_enters_rate_protection_mode(self):
+        _, _, breakdown = calculate_recommended_price(
+            occupancy=1.0,
+            day_name="Friday",
+            competitor_price=140.0,
+            raw_otb_occupancy=1.0,
+            adjusted_otb_occupancy=1.0,
+            total_rooms=100,
+            adjusted_otb_rooms=100,
+            return_breakdown=True,
+        )
+
+        self.assertEqual(breakdown["pricing_mode"], "rate_protection")
+        self.assertEqual(breakdown["selected_objective"], "rate_protection")
+        self.assertEqual(breakdown["sellable_rooms"], 0.0)
+        self.assertEqual(breakdown["candidate_remaining_revenue"], 0.0)
+
+    def test_partially_retained_inventory_selects_best_remaining_room_revenue(self):
+        price, _, breakdown = calculate_recommended_price(
+            occupancy=0.92,
+            day_name="Friday",
+            competitor_price=150.0,
+            raw_otb_occupancy=0.82,
+            adjusted_otb_occupancy=0.70,
+            total_rooms=100,
+            adjusted_otb_rooms=70,
+            return_breakdown=True,
+        )
+
+        best_remaining_revenue = max(
+            row["candidate_remaining_revenue"] for row in breakdown["optimizer_candidates"]
+        )
+        self.assertEqual(breakdown["pricing_mode"], "remaining_room_optimization")
+        self.assertEqual(breakdown["selected_objective"], "candidate_remaining_revenue")
+        self.assertEqual(breakdown["selected_candidate"]["candidate_remaining_revenue"], best_remaining_revenue)
+        self.assertEqual(price, breakdown["selected_candidate"]["price"])
+
+    def test_live_total_rooms_changes_expected_room_calculation(self):
+        _, _, small = calculate_recommended_price(
+            occupancy=0.80,
+            day_name="Friday",
+            competitor_price=140.0,
+            total_rooms=100,
+            adjusted_otb_rooms=0,
+            return_breakdown=True,
+        )
+        _, _, large = calculate_recommended_price(
+            occupancy=0.80,
+            day_name="Friday",
+            competitor_price=140.0,
+            total_rooms=200,
+            adjusted_otb_rooms=0,
+            return_breakdown=True,
+        )
+
+        self.assertAlmostEqual(large["expected_rooms"], small["expected_rooms"] * 2, delta=0.02)
+
+    def test_candidate_grid_stays_inside_dynamic_bounds(self):
+        prices = _candidate_prices(141.46, 143.00, anchors=[142.2, 150.0])
+
+        self.assertTrue(prices)
+        self.assertTrue(all(141.46 <= price <= 143.00 for price in prices))
+        self.assertIn(141.46, prices)
+        self.assertIn(143.00, prices)
+
+    def test_near_tie_candidate_selection_uses_risk_preference(self):
+        candidates = [
+            {"price": 140.0, "candidate_remaining_revenue": 1000.0},
+            {"price": 145.0, "candidate_remaining_revenue": 995.0},
+        ]
+
+        self.assertEqual(_select_candidate(candidates, "candidate_remaining_revenue", False)["price"], 140.0)
+        self.assertEqual(_select_candidate(candidates, "candidate_remaining_revenue", True)["price"], 145.0)
 
     def test_sold_out_raw_otb_applies_competitor_parity_floor(self):
         price, _, breakdown = calculate_recommended_price(

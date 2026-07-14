@@ -9,7 +9,7 @@ The most important design choice is separation of responsibilities:
 - The LLM helps interpret language, classify intent, detect ambiguity, and produce manager-friendly wording.
 - Deterministic repository code owns data access, date resolution, local-intel impact estimates, scenario execution, ADR math, pricing guardrails, and final simulation results.
 
-This makes the chatbot presentation-friendly for a lead data scientist: it demonstrates practical LLM orchestration while keeping revenue decisions auditable and grounded.
+This makes the chatbot presentation-friendly : it demonstrates practical LLM orchestration while keeping revenue decisions auditable and grounded.
 
 ## Why This Was Built
 

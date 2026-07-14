@@ -4,9 +4,16 @@
     Your job is NOT to invent, adjust, or override the price. Your job is to write a short hotel revenue manager briefing, classify risk, and recommend whether a human should review before publishing.
 
 ### OPERATIONAL DATA
-    - Current Booked Occupancy: {current_booked_occ:.1f}%
-    - Likely Retained Occupancy After Expected Cancellations: {retained_otb_occ:.1f}%
-    - Forecasted Occupancy: {forecasted_occ:.1f}%
+    - Current OTB Occupancy: {current_booked_occ:.1f}%
+    - Likely Retained OTB After Expected Cancellations: {retained_otb_occ:.1f}%
+    - ML Forecast Occupancy: {forecasted_occ:.1f}%
+    - Retained Rooms: {retained_rooms:.0f}
+    - Sellable Rooms: {sellable_rooms:.0f}
+    - Expected Cancellations: {expected_cancellations_rooms:.0f}
+    - Pricing Mode: {pricing_mode}
+    - Selected Objective: {selected_objective}
+    - Candidate Remaining Rooms: {candidate_remaining_rooms:.0f}
+    - Candidate Remaining Revenue: ${candidate_remaining_revenue:.2f}
     - Inventory Status Ratio: {inventory_status:.2f}
     - Sold-Out State: {sold_out_label}
     - Optimizer ADR: ${optimized_price:.2f}
@@ -43,14 +50,18 @@
     5. Choose exactly one action label: Accept Optimizer Price, Review Before Publishing, Hold For Manual Approval, or Investigate Data Quality.
     6. Make the recommendation owner-facing: clear, concise, and confident.
     7. Write for a hotel GM or revenue manager, not a data scientist.
+    8. Prioritize sellable-room opportunity when rooms remain; if no sellable rooms remain, explain rate protection instead of revenue opportunity.
 
 ### MANAGER-FRIENDLY WRITING RULES
     - ai_owner_summary must be no more than 4 sentences.
-    - Mention the ADR, current booked occupancy, booking pace, competitor price, and recommended action.
-    - If likely retained occupancy differs materially from current booked occupancy, mention it separately instead of calling the forecast "already booked."
-    - Keep forecasted occupancy separate from current booked occupancy.
-    - Prefer the terms ADR, booked, likely retained occupancy, forecast occupancy, pickup is ahead/behind, competitors are higher/lower, inventory is tight, market-safe, and review before publishing.
-    - Do not use technical phrases like raw OTB, retained OTB, compression, blended reference price, candidate optimizer, expected revenue among candidates, elasticity, diagnostics, algorithm, or model math.
+    - Mention the ADR, current OTB, booking pace, competitor price, and recommended action.
+    - Mention sellable rooms and expected cancellations as whole rooms when they affect the decision.
+    - If Pricing Mode is rate protection, say no sellable rooms remain and frame the ADR as inventory protection.
+    - If Pricing Mode is remaining room optimization, explain that the recommendation is based on remaining sellable rooms.
+    - If likely retained OTB differs materially from current OTB, mention it separately instead of calling the forecast "already booked."
+    - Keep ML forecast occupancy separate from current OTB.
+    - Prefer the terms ADR, current OTB, likely retained OTB, sellable rooms, expected cancellations, ML forecast occupancy, pickup is ahead/behind, competitors are higher/lower, inventory is tight, market-safe, and review before publishing.
+    - Do not use technical phrases like raw OTB, compression, blended reference price, candidate optimizer, expected revenue among candidates, elasticity, diagnostics, algorithm, or model math.
     - Keep ai_review_flags short and operational, such as "Inventory is tight; confirm remaining-room strategy."
 
 ### REQUIRED JSON OUTPUT

@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
 from pricing_core.engine import calculate_recommended_price, normalize_market_context
-from project_core.config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE, PRICING_DECISION_LOG_PATH
+from project_core.config import API_KEY, CHAT_MODEL, BASE_URL, STRATEGIST_PROMPT_PATH, MIN_PRICE, MAX_PRICE, BASE_PRICE, BASE_CAPACITY, PRICING_DECISION_LOG_PATH
 from openai import OpenAI
 from utils.utility_functions import load_prompt
 import httpx
@@ -55,6 +55,8 @@ class AgentState(TypedDict):
     raw_otb_occupancy: float
     adjusted_otb_occupancy: float
     expected_cancellations: float
+    total_rooms: float
+    adjusted_otb_rooms: float
     sold_out: bool
     competitor_price: float
     market_context: Dict[str, Any]
@@ -208,8 +210,13 @@ def _pace_phrase(gross_pace_index: float, pickup_trend_index: float) -> str:
     return f"{gross_clause}, and {pickup_clause}"
 
 
+def _room_count(value) -> str:
+    return f"{round(_safe_float(value, 0.0)):,.0f}"
+
+
 def _manager_summary(state: AgentState, action: str) -> str:
     adr = _safe_float(state.get("optimized_price"), MIN_PRICE)
+    diagnostics = state.get("optimizer_diagnostics", {})
     raw_booked_occupancy = _safe_float(
         state.get("raw_otb_occupancy"),
         _safe_float(state.get("current_occupancy")),
@@ -219,6 +226,13 @@ def _manager_summary(state: AgentState, action: str) -> str:
         _safe_float(state.get("current_occupancy")),
     )
     forecasted_occupancy = _safe_float(state.get("forecasted_occupancy"))
+    pricing_mode = str(diagnostics.get("pricing_mode") or "remaining_room_optimization")
+    sellable_rooms = _safe_float(diagnostics.get("sellable_rooms"), 0.0)
+    candidate_remaining_rooms = _safe_float(
+        diagnostics.get("candidate_remaining_rooms"),
+        _safe_float(diagnostics.get("remaining_rooms"), 0.0),
+    )
+    candidate_remaining_revenue = _safe_float(diagnostics.get("candidate_remaining_revenue"), 0.0)
     gross_pace_index = _safe_float(state.get("gross_pace_index"), _safe_float(state.get("booking_velocity"), 1.0))
     pickup_trend_index = _safe_float(state.get("pickup_trend_index"), gross_pace_index)
     market_context = state.get("market_context") or {}
@@ -263,7 +277,17 @@ def _manager_summary(state: AgentState, action: str) -> str:
         "Investigate Data Quality": "Check the data before publishing this ADR.",
     }.get(action, "Review before publishing to confirm the ADR fits your positioning and remaining-room strategy.")
 
-    booking_sentence = f"The recommended ADR is ${adr:.2f}."
+    if pricing_mode == "rate_protection" or sellable_rooms <= 0:
+        booking_sentence = (
+            f"The recommended ADR is ${adr:.2f}; no sellable rooms remain, so this is a rate-protection recommendation."
+        )
+    else:
+        booking_sentence = (
+            f"The recommended ADR is ${adr:.2f}, with {_room_count(sellable_rooms)} sellable rooms; "
+            f"at this ADR, the system expects "
+            f"{_room_count(candidate_remaining_rooms)} remaining-room bookings and about "
+            f"${candidate_remaining_revenue:,.0f} of remaining-room revenue."
+        )
     occupancy_sentence = f"The hotel is currently {raw_booked_occupancy * 100:.1f}% booked"
     if abs(raw_booked_occupancy - retained_otb_occupancy) >= 0.05:
         occupancy_sentence += (
@@ -301,6 +325,13 @@ def _manager_friendly_flags(flags) -> List[str]:
             continue
         for old, new in replacements.items():
             text = re.sub(old, new, text, flags=re.IGNORECASE)
+        text = re.sub(r"\bHigh strong demand\b", "Demand is high", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"Demand is high and fast pickup detected",
+            "Demand is high and pickup is fast",
+            text,
+            flags=re.IGNORECASE,
+        )
         cleaned.append(text[:140])
     return cleaned[:3]
 
@@ -344,6 +375,21 @@ def _build_decision_context_components(state: AgentState, final_adr: float) -> L
     breakdown = state.get("pricing_breakdown", {})
     context_rows = [
         {
+            "Signal": "Recommended action",
+            "Value": state.get("ai_recommended_action", "Review Before Publishing"),
+            "Why it matters": "Shows whether the manager should publish, review, hold, or investigate before action.",
+        },
+        {
+            "Signal": "Sellable rooms",
+            "Value": _room_count(breakdown.get("sellable_rooms")),
+            "Why it matters": "Only rooms still expected to be sellable can create remaining-room opportunity.",
+        },
+        {
+            "Signal": "Expected cancellations",
+            "Value": _room_count(breakdown.get("expected_cancellations")),
+            "Why it matters": "Explains why current OTB and likely retained OTB may differ.",
+        },
+        {
             "Signal": "Current booked occupancy",
             "Value": f"{round(_safe_float(breakdown.get('raw_otb_occupancy'), 0.0) * 100)}%",
             "Why it matters": "Shows whether the hotel is already fully booked on paper.",
@@ -379,6 +425,16 @@ def _build_decision_context_components(state: AgentState, final_adr: float) -> L
                     else "Unavailable"
                 ),
                 "Why it matters": "Shows where the market is priced for the date.",
+            },
+            {
+                "Signal": "Pricing mode",
+                "Value": str(breakdown.get("pricing_mode", "remaining_room_optimization")).replace("_", " ").title(),
+                "Why it matters": "Separates sellable-room optimization from rate protection when no rooms remain.",
+            },
+            {
+                "Signal": "Remaining-room revenue",
+                "Value": f"${_safe_float(breakdown.get('candidate_remaining_revenue'), 0.0):,.0f}",
+                "Why it matters": "Shows the revenue basis used for remaining sellable rooms.",
             },
         ]
     )
@@ -435,6 +491,11 @@ def data_ingestion_node(state: AgentState):
         date_data.get("adjusted_otb_occupancy"),
         _safe_float(state.get("adjusted_otb_occupancy"), state.get("current_occupancy", 0.0)),
     )
+    total_rooms = max(_safe_float(date_data.get("total_rooms"), _safe_float(state.get("total_rooms"), BASE_CAPACITY)), 1.0)
+    adjusted_otb_rooms = _safe_float(
+        date_data.get("adjusted_otb"),
+        _safe_float(state.get("adjusted_otb_rooms"), adjusted_otb_occupancy * total_rooms),
+    )
     expected_cancellations = _safe_float(
         date_data.get("expected_cancellations"),
         _safe_float(state.get("expected_cancellations"), 0.0),
@@ -450,6 +511,8 @@ def data_ingestion_node(state: AgentState):
         "market_context": market_context,
         "raw_otb_occupancy": raw_otb_occupancy,
         "adjusted_otb_occupancy": adjusted_otb_occupancy,
+        "total_rooms": total_rooms,
+        "adjusted_otb_rooms": adjusted_otb_rooms,
         "expected_cancellations": expected_cancellations,
         "sold_out": raw_otb_occupancy >= 0.9999,
     }
@@ -485,6 +548,8 @@ def optimizer_node(state: AgentState):
         raw_otb_occupancy=state.get("raw_otb_occupancy"),
         adjusted_otb_occupancy=adjusted_otb_occupancy,
         expected_cancellations=state.get("expected_cancellations", 0.0),
+        total_rooms=state.get("total_rooms", BASE_CAPACITY),
+        adjusted_otb_rooms=state.get("adjusted_otb_rooms"),
     )
     if manual_shock != 0:
         flags.append(f"Manual demand adjustment applied ({manual_shock * 100:+.0f}%)")
@@ -520,6 +585,11 @@ def optimizer_node(state: AgentState):
         "sold_out_floor_price": breakdown.get("sold_out_floor_price"),
         "sold_out_floor_applied": breakdown.get("sold_out_floor_applied"),
         "material_retention_gap": breakdown.get("material_retention_gap"),
+        "total_rooms": breakdown.get("total_rooms"),
+        "retained_rooms": breakdown.get("retained_rooms"),
+        "sellable_rooms": breakdown.get("sellable_rooms"),
+        "pricing_mode": breakdown.get("pricing_mode"),
+        "selected_objective": breakdown.get("selected_objective"),
         "pricing_occupancy": breakdown.get("pricing_occupancy"),
         "demand_anchor": breakdown.get("demand_anchor"),
         "elasticity": breakdown.get("elasticity"),
@@ -533,11 +603,22 @@ def optimizer_node(state: AgentState):
         "selected_candidate": breakdown.get("selected_candidate"),
         "expected_rooms": breakdown.get("expected_rooms"),
         "expected_revenue": breakdown.get("expected_revenue"),
+        "modeled_total_rooms": breakdown.get("modeled_total_rooms"),
+        "modeled_total_revenue": breakdown.get("modeled_total_revenue"),
+        "remaining_rooms": breakdown.get("remaining_rooms"),
+        "remaining_revenue": breakdown.get("remaining_revenue"),
+        "candidate_remaining_rooms": breakdown.get("candidate_remaining_rooms"),
+        "candidate_remaining_revenue": breakdown.get("candidate_remaining_revenue"),
         "competitor_gap_pct": breakdown.get("competitor_gap_pct"),
         "review_flags": breakdown.get("review_flags", []),
         "top_candidates": sorted(
             breakdown.get("optimizer_candidates", []),
-            key=lambda row: row.get("expected_revenue", 0),
+            key=lambda row: row.get(
+                "candidate_remaining_revenue"
+                if breakdown.get("pricing_mode") == "remaining_room_optimization"
+                else "modeled_total_revenue",
+                0,
+            ),
             reverse=True,
         )[:5],
     }
@@ -605,6 +686,13 @@ def strategist_node(state: AgentState):
     prompt_data = {"current_booked_occ":state['raw_otb_occupancy'] * 100,
                    "retained_otb_occ":state['adjusted_otb_occupancy'] * 100,
                    "forecasted_occ":state['forecasted_occupancy'] * 100,
+                   "sellable_rooms": _safe_float(diagnostics.get("sellable_rooms"), 0.0),
+                   "retained_rooms": _safe_float(diagnostics.get("retained_rooms"), 0.0),
+                   "expected_cancellations_rooms": _safe_float(diagnostics.get("expected_cancellations"), 0.0),
+                   "candidate_remaining_rooms": _safe_float(diagnostics.get("candidate_remaining_rooms"), 0.0),
+                   "candidate_remaining_revenue": _safe_float(diagnostics.get("candidate_remaining_revenue"), 0.0),
+                   "pricing_mode": str(diagnostics.get("pricing_mode", "remaining_room_optimization")).replace("_", " "),
+                   "selected_objective": str(diagnostics.get("selected_objective", "remaining_room_revenue")).replace("_", " "),
                    "inventory_status":state['raw_otb_occupancy']/max(state['forecasted_occupancy'], 0.01),
                    "sold_out_label":"Yes" if state.get("sold_out") else "No",
                    "optimized_price": optimized_price,
@@ -817,7 +905,7 @@ def run_agentic_pricing(
     local_applied_adr_headroom = _safe_float(local_intel_applied_adr_headroom, 0.0)
     total_shock = _safe_float(manual_shock, 0.0) + local_applied_shock
     market_state = market_state or {}
-    total_rooms = max(_safe_float(market_state.get("total_rooms"), 0.0), 1.0)
+    total_rooms = max(_safe_float(market_state.get("total_rooms"), BASE_CAPACITY), 1.0)
     inferred_raw_otb_occupancy = (
         _safe_float(market_state.get("current_otb"), 0.0) / total_rooms
         if market_state.get("current_otb") is not None
@@ -828,6 +916,7 @@ def run_agentic_pricing(
         adjusted_otb_occupancy,
         _safe_float(market_state.get("adjusted_otb_occupancy"), current_occupancy),
     )
+    adjusted_rooms = _safe_float(market_state.get("adjusted_otb"), adjusted_occ * total_rooms)
     expected_cancel_rooms = (
         _safe_float(expected_cancellations)
         if expected_cancellations is not None
@@ -866,6 +955,8 @@ def run_agentic_pricing(
         "current_occupancy": adjusted_occ,
         "raw_otb_occupancy": raw_occ,
         "adjusted_otb_occupancy": adjusted_occ,
+        "total_rooms": total_rooms,
+        "adjusted_otb_rooms": adjusted_rooms,
         "expected_cancellations": expected_cancel_rooms,
         "sold_out": raw_occ >= 0.9999,
         "competitor_price": competitor_price,

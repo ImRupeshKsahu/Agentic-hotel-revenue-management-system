@@ -528,7 +528,7 @@ def answer_horizon_rank_question(message: str, context: ScenarioChatContext) -> 
     if not request:
         return ScenarioChatResponse(
             answer=(
-                "I can rank the Scenario Lab horizon by expected revenue at recommended ADR, revenue upside, "
+                "I can rank the Scenario Lab horizon by remaining-room opportunity, modeled lift versus booked ADR, "
                 "recommended ADR, booked occupancy, likely retained occupancy, forecast occupancy, or comp median."
             ),
             source_labels=["30-day Scenario Lab ranking"],
@@ -543,8 +543,8 @@ def answer_horizon_rank_question(message: str, context: ScenarioChatContext) -> 
     direction = request["direction"]
     metric_label = _horizon_rank_metric_label(metric)
     ranked = sorted(
-        [record for record in records if _optional_float(record.get(metric)) is not None],
-        key=lambda record: _safe_float(record.get(metric), 0.0),
+        [record for record in records if _optional_float(_horizon_metric_value(record, metric)) is not None],
+        key=lambda record: _safe_float(_horizon_metric_value(record, metric), 0.0),
         reverse=direction == "top",
     )[:limit]
 
@@ -560,7 +560,7 @@ def answer_horizon_rank_question(message: str, context: ScenarioChatContext) -> 
     rows = []
     for index, record in enumerate(ranked, start=1):
         rows.append(
-            f"{index}. {record.get('date')}: {_format_horizon_rank_value(metric, record.get(metric))} "
+            f"{index}. {record.get('date')}: {_format_horizon_rank_value(metric, _horizon_metric_value(record, metric))} "
             f"(ADR ${_safe_float(record.get('recommended_adr'), 0.0):.2f}, "
             f"forecast {_format_pct(record.get('forecasted_occupancy'))}, "
             f"booked {_format_pct(record.get('raw_otb_occupancy'))})"
@@ -1172,8 +1172,8 @@ def _resolve_ranked_date_reference(message: str, context: ScenarioChatContext) -
         records = [record for record in records if str(record.get("date") or "") != context.target_date]
     metric = request["metric"]
     ranked = sorted(
-        [record for record in records if _optional_float(record.get(metric)) is not None],
-        key=lambda record: _safe_float(record.get(metric), 0.0),
+        [record for record in records if _optional_float(_horizon_metric_value(record, metric)) is not None],
+        key=lambda record: _safe_float(_horizon_metric_value(record, metric), 0.0),
         reverse=request["direction"] == "top",
     )
     if not ranked:
@@ -1183,7 +1183,7 @@ def _resolve_ranked_date_reference(message: str, context: ScenarioChatContext) -
         "date": str(selected.get("date") or ""),
         "metric": metric,
         "direction": request["direction"],
-        "value": selected.get(metric),
+        "value": _horizon_metric_value(selected, metric),
         "excluded_selected_date": _excludes_selected_date(normalized),
     }
 
@@ -1296,8 +1296,18 @@ def _parse_rank_limit(normalized: str) -> Optional[int]:
 
 
 def _parse_horizon_rank_metric(normalized: str) -> str:
-    if "revenue upside" in normalized or "upside" in normalized:
-        return "revenue_upside"
+    if "remaining room" in normalized or "remaining-room" in normalized or "sellable" in normalized:
+        return "remaining_room_opportunity"
+    if "revenue opportunity" in normalized or "opportunity" in normalized:
+        return "remaining_room_opportunity"
+    if (
+        "modeled lift" in normalized
+        or "upside vs booked" in normalized
+        or "upside versus booked" in normalized
+        or "revenue upside" in normalized
+        or "upside" in normalized
+    ):
+        return "modeled_lift_vs_booked_adr"
     if "revenue" in normalized and ("recommended" in normalized or "adr" in normalized or "forecast" in normalized):
         return "expected_revenue"
     if "recommended adr" in normalized or "adr" in normalized or "price" in normalized:
@@ -1318,7 +1328,9 @@ def _parse_horizon_rank_metric(normalized: str) -> str:
 def _horizon_rank_metric_label(metric: str) -> str:
     return {
         "expected_revenue": "expected revenue at recommended ADR",
-        "revenue_upside": "upside versus booked ADR",
+        "remaining_room_opportunity": "remaining-room opportunity",
+        "modeled_lift_vs_booked_adr": "modeled lift versus booked ADR",
+        "revenue_upside": "modeled lift versus booked ADR",
         "recommended_adr": "recommended ADR",
         "raw_otb_occupancy": "booked occupancy",
         "adjusted_otb_occupancy": "likely retained occupancy",
@@ -1329,11 +1341,26 @@ def _horizon_rank_metric_label(metric: str) -> str:
 
 def _format_horizon_rank_value(metric: str, value: Any) -> str:
     number = _safe_float(value, 0.0)
-    if metric in {"expected_revenue", "revenue_upside", "recommended_adr", "competitor_median"}:
+    if metric in {
+        "expected_revenue",
+        "remaining_room_opportunity",
+        "modeled_lift_vs_booked_adr",
+        "revenue_upside",
+        "recommended_adr",
+        "competitor_median",
+    }:
         return f"${number:,.2f}"
     if metric in {"raw_otb_occupancy", "adjusted_otb_occupancy", "forecasted_occupancy"}:
         return _format_pct(number)
     return f"{number:.2f}"
+
+
+def _horizon_metric_value(record: Dict[str, Any], metric: str) -> Any:
+    if metric == "modeled_lift_vs_booked_adr" and record.get(metric) is None:
+        return record.get("revenue_upside")
+    if metric == "revenue_upside" and record.get(metric) is None:
+        return record.get("modeled_lift_vs_booked_adr")
+    return record.get(metric)
 
 
 def _rank_direction_label(direction: str) -> str:
@@ -1364,7 +1391,8 @@ def _rank_horizon_risks(records: List[Dict[str, Any]], limit: int = 3) -> List[D
             bool(item.get("manual_approval_required")),
             bool(item.get("sold_out")) and bool(item.get("material_retention_gap")),
             len(item.get("review_flags") or []),
-            _safe_float(item.get("revenue_upside"), 0.0),
+            _safe_float(item.get("remaining_room_opportunity"), 0.0),
+            _safe_float(item.get("modeled_lift_vs_booked_adr", item.get("revenue_upside")), 0.0),
             str(item.get("date", "")),
         ),
         reverse=True,

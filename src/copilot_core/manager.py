@@ -25,10 +25,15 @@ def _nearest_candidate_for_price(breakdown: Dict[str, Any], price: float) -> Dic
     candidates = breakdown.get("optimizer_candidates", [])
     if not candidates:
         expected_rooms = _safe_float(breakdown.get("expected_rooms"))
+        remaining_rooms = _safe_float(breakdown.get("remaining_rooms"))
         return {
             "price": price,
             "expected_rooms": expected_rooms,
             "expected_revenue": round(price * expected_rooms, 2),
+            "modeled_total_rooms": expected_rooms,
+            "modeled_total_revenue": round(price * expected_rooms, 2),
+            "candidate_remaining_rooms": remaining_rooms,
+            "candidate_remaining_revenue": round(price * remaining_rooms, 2),
         }
     return min(
         candidates,
@@ -68,22 +73,101 @@ def _manager_friendly_review_flags(flags: Iterable[str]) -> List[str]:
             continue
         for old, new in replacements.items():
             text = re.sub(old, new, text, flags=re.IGNORECASE)
+        text = re.sub(r"\bHigh strong demand\b", "Demand is high", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"Demand is high and fast pickup detected",
+            "Demand is high and pickup is fast",
+            text,
+            flags=re.IGNORECASE,
+        )
         cleaned.append(text)
     return cleaned
 
 
-def _top_reasons(breakdown: Dict[str, Any], revenue_upside: float, review_flags: List[str]) -> List[str]:
+def _review_priority(
+    review_status: str,
+    review_flags: Iterable[str],
+    manual_approval_required: bool,
+    sold_out: bool,
+    material_retention_gap: bool,
+    remaining_room_opportunity: float,
+    pricing_mode: str,
+) -> str:
+    if review_status != "Review needed":
+        return "None"
+    flag_text = " ".join(str(flag).lower() for flag in review_flags)
+    material_flag_terms = [
+        "data",
+        "competitor",
+        "premium",
+        "underpricing",
+        "fully booked",
+        "likely retained occupancy is lower",
+        "usual pricing level",
+    ]
+    if (
+        manual_approval_required
+        or (sold_out and material_retention_gap)
+        or pricing_mode == "rate_protection"
+        or remaining_room_opportunity >= 500
+        or any(term in flag_text for term in material_flag_terms)
+    ):
+        return "Priority review"
+    return "Routine watch"
+
+
+def _recommended_action(pricing_mode: str, remaining_room_opportunity: float, review_status: str) -> str:
+    if pricing_mode == "rate_protection":
+        return "Rate protection"
+    if review_status == "Review needed":
+        return "Review"
+    if remaining_room_opportunity > 0:
+        return "Publish"
+    return "Monitor"
+
+
+def _top_reasons(
+    breakdown: Dict[str, Any],
+    remaining_room_opportunity: float,
+    modeled_lift_vs_booked_adr: float,
+    review_flags: List[str],
+) -> List[str]:
     reasons = []
-    if revenue_upside > 0:
-        reasons.append(f"${revenue_upside:,.0f} upside versus booked ADR.")
+    if remaining_room_opportunity > 0:
+        reasons.append(f"${remaining_room_opportunity:,.0f} remaining-room opportunity.")
+    elif breakdown.get("pricing_mode") == "rate_protection":
+        reasons.append("No sellable rooms remain; protect rate and monitor cancellations.")
+    elif modeled_lift_vs_booked_adr > 0:
+        reasons.append(f"${modeled_lift_vs_booked_adr:,.0f} modeled lift versus booked ADR.")
     if breakdown.get("sold_out"):
-        reasons.append("The hotel is fully booked on paper; protect scarce remaining inventory.")
+        reasons.append("The hotel is fully booked on paper; protect scarce inventory.")
     elif _safe_float(breakdown.get("compression_score")) >= 0.60:
         reasons.append("Demand is strong.")
     if _safe_float(breakdown.get("pickup_trend_index"), 1.0) >= 1.20:
         reasons.append("Recent pickup is accelerating.")
     reasons.extend(str(flag) for flag in review_flags[:2])
     return reasons[:3]
+
+
+def _action_queue(records: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    rows = list(records)
+    return {
+        "publish": [
+            row for row in rows if row.get("recommended_action") == "Publish"
+        ],
+        "review": [
+            row for row in rows
+            if row.get("review_priority") == "Priority review" and row.get("recommended_action") != "Rate protection"
+        ],
+        "monitor": [
+            row for row in rows
+            if row.get("recommended_action") == "Monitor"
+            or (row.get("review_priority") == "Routine watch" and row.get("recommended_action") != "Rate protection")
+        ],
+        "rate_protection": [
+            row for row in rows if row.get("recommended_action") == "Rate protection"
+        ],
+    }
 
 
 def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -137,6 +221,8 @@ def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Di
             raw_otb_occupancy=raw_otb_occupancy,
             adjusted_otb_occupancy=adjusted_otb_occupancy,
             expected_cancellations=live_entry.get("expected_cancellations", 0.0),
+            total_rooms=total_rooms,
+            adjusted_otb_rooms=adjusted_otb,
         )
         reference_price = _safe_float(breakdown.get("reference_price"))
         booked_adr = _safe_float(live_entry.get("booked_adr"), reference_price)
@@ -146,7 +232,16 @@ def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Di
         expected_rooms = _safe_float(breakdown.get("expected_rooms"))
         reference_revenue_proxy = _safe_float(reference_candidate.get("expected_revenue"))
         booked_adr_revenue_proxy = _safe_float(booked_adr_candidate.get("expected_revenue"))
-        revenue_upside = max(0.0, round(expected_revenue - booked_adr_revenue_proxy, 2))
+        booked_adr_remaining_revenue_proxy = _safe_float(booked_adr_candidate.get("candidate_remaining_revenue"))
+        modeled_lift_vs_booked_adr = max(0.0, round(expected_revenue - booked_adr_revenue_proxy, 2))
+        candidate_remaining_rooms = _safe_float(breakdown.get("candidate_remaining_rooms"))
+        candidate_remaining_revenue = _safe_float(breakdown.get("candidate_remaining_revenue"))
+        remaining_room_opportunity = max(
+            0.0,
+            round(candidate_remaining_revenue - booked_adr_remaining_revenue_proxy, 2),
+        )
+        sellable_rooms = _safe_float(breakdown.get("sellable_rooms"), max(0.0, total_rooms - adjusted_otb))
+        pricing_mode = str(breakdown.get("pricing_mode", "remaining_room_optimization"))
         review_flags = _manager_friendly_review_flags(breakdown.get("review_flags", []))
         manual_approval_required = _manual_approval_required(breakdown, final_price, review_flags)
         if breakdown.get("sold_out") and breakdown.get("material_retention_gap"):
@@ -155,6 +250,16 @@ def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Di
             ]
             manual_approval_required = True
         review_status = "Review needed" if review_flags or manual_approval_required else "No review"
+        recommended_action = _recommended_action(pricing_mode, remaining_room_opportunity, review_status)
+        review_priority = _review_priority(
+            review_status,
+            review_flags,
+            manual_approval_required,
+            bool(breakdown.get("sold_out")),
+            bool(breakdown.get("material_retention_gap")),
+            remaining_room_opportunity,
+            pricing_mode,
+        )
         records.append(
             {
                 "date": date_key,
@@ -167,10 +272,25 @@ def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Di
                 "booked_adr_proxy_price": round(_safe_float(booked_adr_candidate.get("price")), 2),
                 "booked_adr_proxy_expected_rooms": round(_safe_float(booked_adr_candidate.get("expected_rooms")), 2),
                 "booked_adr_revenue_proxy": round(booked_adr_revenue_proxy, 2),
-                "revenue_upside": round(revenue_upside, 2),
+                "booked_adr_proxy_remaining_rooms": round(_safe_float(booked_adr_candidate.get("candidate_remaining_rooms")), 2),
+                "booked_adr_remaining_revenue_proxy": round(booked_adr_remaining_revenue_proxy, 2),
+                "candidate_remaining_rooms": round(candidate_remaining_rooms, 2),
+                "candidate_remaining_revenue": round(candidate_remaining_revenue, 2),
+                "sellable_rooms": round(sellable_rooms, 2),
+                "remaining_room_opportunity": round(remaining_room_opportunity, 2),
+                "modeled_lift_vs_booked_adr": round(modeled_lift_vs_booked_adr, 2),
+                "revenue_upside": round(modeled_lift_vs_booked_adr, 2),
+                "pricing_mode": pricing_mode,
+                "recommended_action": recommended_action,
                 "review_status": review_status,
+                "review_priority": review_priority,
                 "review_flags": review_flags,
-                "top_reasons": _top_reasons(breakdown, revenue_upside, review_flags),
+                "top_reasons": _top_reasons(
+                    breakdown,
+                    remaining_room_opportunity,
+                    modeled_lift_vs_booked_adr,
+                    review_flags,
+                ),
                 "current_otb": round(current_otb, 2),
                 "stayover_otb": round(stayover_otb, 2),
                 "future_arrival_otb": round(future_arrival_otb, 2),
@@ -195,9 +315,37 @@ def build_opportunity_records(forecast_df: pd.DataFrame, live_data: Dict[str, Di
 
 
 def rank_top_opportunities(records: Iterable[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    opportunity_records = [
+        record
+        for record in records
+        if _safe_float(record.get("remaining_room_opportunity")) > 0
+        and _safe_float(record.get("sellable_rooms")) > 0
+        and record.get("pricing_mode") != "rate_protection"
+    ]
     return sorted(
-        records,
-        key=lambda item: (item["revenue_upside"], item["expected_revenue"], item["date"]),
+        opportunity_records,
+        key=lambda item: (
+            _safe_float(item.get("remaining_room_opportunity")),
+            _safe_float(item.get("sellable_rooms")),
+            item["date"],
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def rank_rate_protection_dates(records: Iterable[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    protection_records = [
+        record
+        for record in records
+        if record.get("pricing_mode") == "rate_protection" or _safe_float(record.get("sellable_rooms")) <= 0
+    ]
+    return sorted(
+        protection_records,
+        key=lambda item: (
+            bool(item.get("sold_out")),
+            _safe_float(item.get("modeled_lift_vs_booked_adr", item.get("revenue_upside"))),
+            item["date"],
+        ),
         reverse=True,
     )[:limit]
 
@@ -207,10 +355,12 @@ def rank_top_risks(records: Iterable[Dict[str, Any]], limit: int = 5) -> List[Di
     return sorted(
         risk_records,
         key=lambda item: (
+            item.get("review_priority") == "Priority review",
             item["manual_approval_required"],
             item["sold_out"] and item["material_retention_gap"],
             len(item["review_flags"]),
-            item["revenue_upside"],
+            _safe_float(item.get("remaining_room_opportunity")),
+            _safe_float(item.get("modeled_lift_vs_booked_adr", item.get("revenue_upside"))),
             item["date"],
         ),
         reverse=True,
@@ -219,12 +369,29 @@ def rank_top_risks(records: Iterable[Dict[str, Any]], limit: int = 5) -> List[Di
 
 def build_summary_metrics(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     rows = list(records)
+    queue = _action_queue(rows)
+    dates_with_remaining_room_upside = sum(
+        1 for row in rows if _safe_float(row.get("remaining_room_opportunity")) > 0
+    )
     return {
         "dates_evaluated": len(rows),
-        "dates_with_upside": sum(1 for row in rows if row["revenue_upside"] > 0),
+        "dates_with_remaining_room_upside": dates_with_remaining_room_upside,
+        "dates_with_sellable_opportunity": dates_with_remaining_room_upside,
+        "dates_with_upside": sum(1 for row in rows if _safe_float(row.get("modeled_lift_vs_booked_adr", row.get("revenue_upside"))) > 0),
         "dates_needing_review": sum(1 for row in rows if row["review_status"] == "Review needed"),
+        "priority_review_dates": len(queue["review"]),
+        "routine_watch_dates": len(queue["monitor"]),
+        "publish_dates": len(queue["publish"]),
+        "rate_protection_dates": sum(
+            1 for row in rows if row.get("pricing_mode") == "rate_protection" or _safe_float(row.get("sellable_rooms")) <= 0
+        ),
         "sold_out_dates": sum(1 for row in rows if row["sold_out"]),
-        "total_revenue_upside": round(sum(row["revenue_upside"] for row in rows), 2),
+        "total_remaining_room_opportunity": round(sum(_safe_float(row.get("remaining_room_opportunity")) for row in rows), 2),
+        "total_modeled_lift_vs_booked_adr": round(
+            sum(_safe_float(row.get("modeled_lift_vs_booked_adr", row.get("revenue_upside"))) for row in rows),
+            2,
+        ),
+        "total_revenue_upside": round(sum(_safe_float(row.get("modeled_lift_vs_booked_adr", row.get("revenue_upside"))) for row in rows), 2),
     }
 
 
@@ -330,22 +497,57 @@ def build_champion_model_audit(champion_payload: Dict[str, Any], audit_summary: 
 
 def build_briefing_payload(records: Iterable[Dict[str, Any]], limit: int = 3) -> Dict[str, Any]:
     rows = list(records)
+    queue = _action_queue(rows)
+    priority_reviews = [
+        row for row in rank_top_risks(rows, limit=max(limit, 5))
+        if row.get("review_priority") == "Priority review" and row.get("recommended_action") != "Rate protection"
+    ][:limit]
     return {
+        "action_queue_counts": {
+            "publish": len(queue["publish"]),
+            "priority_review": len(queue["review"]),
+            "routine_watch": len(queue["monitor"]),
+            "rate_protection": len(queue["rate_protection"]),
+        },
         "top_opportunities": [
             {
                 "date": row["date"],
                 "recommended_adr": row["recommended_adr"],
                 "booked_adr": row["booked_adr"],
+                "remaining_room_opportunity": row["remaining_room_opportunity"],
+                "sellable_rooms": row["sellable_rooms"],
+                "recommended_action": row["recommended_action"],
+                "modeled_lift_vs_booked_adr": row["modeled_lift_vs_booked_adr"],
                 "revenue_upside": row["revenue_upside"],
                 "top_reasons": row["top_reasons"],
             }
             for row in rank_top_opportunities(rows, limit=limit)
+        ],
+        "priority_reviews": [
+            {
+                "date": row["date"],
+                "recommended_adr": row["recommended_adr"],
+                "remaining_room_opportunity": row["remaining_room_opportunity"],
+                "review_flags": row["review_flags"][:2],
+                "recommended_action": row["recommended_action"],
+            }
+            for row in priority_reviews
+        ],
+        "top_rate_protection": [
+            {
+                "date": row["date"],
+                "recommended_adr": row["recommended_adr"],
+                "modeled_lift_vs_booked_adr": row["modeled_lift_vs_booked_adr"],
+                "top_reasons": row["top_reasons"],
+            }
+            for row in rank_rate_protection_dates(rows, limit=limit)
         ],
         "top_risks": [
             {
                 "date": row["date"],
                 "recommended_adr": row["recommended_adr"],
                 "review_flags": row["review_flags"][:2],
+                "review_priority": row.get("review_priority", "Priority review"),
             }
             for row in rank_top_risks(rows, limit=limit)
         ],
@@ -355,28 +557,43 @@ def build_briefing_payload(records: Iterable[Dict[str, Any]], limit: int = 3) ->
 
 def deterministic_executive_briefing(payload: Dict[str, Any]) -> str:
     opportunities = payload.get("top_opportunities", [])
-    risks = payload.get("top_risks", [])
+    protection = payload.get("top_rate_protection", [])
+    risks = payload.get("priority_reviews") or payload.get("top_risks", [])
     metrics = payload.get("summary_metrics", {})
+    queue_counts = payload.get("action_queue_counts", {})
     if not opportunities:
-        opportunity_sentence = "No material revenue upside stands out across the next 30 days."
+        if protection:
+            lead = protection[0]
+            opportunity_sentence = (
+                f"No sellable-room opportunity leads the next 30 days; {lead['date']} is mainly a "
+                f"rate-protection date with ${lead['modeled_lift_vs_booked_adr']:,.0f} modeled lift versus booked ADR."
+            )
+        else:
+            opportunity_sentence = "No material sellable-room opportunity stands out across the next 30 days."
     else:
         lead = opportunities[0]
         opportunity_sentence = (
-            f"Focus first on {lead['date']}: the current recommendation shows about "
-            f"${lead['revenue_upside']:,.0f} of upside versus booked ADR."
+            f"Publish queue leads with {lead['date']}: the current recommendation shows about "
+            f"${lead['remaining_room_opportunity']:,.0f} of remaining-room opportunity across "
+            f"{lead['sellable_rooms']:,.0f} sellable rooms."
         )
     if not risks:
-        risk_sentence = "No dates currently require special review before publishing."
+        risk_sentence = "No priority review is required before publishing the leading opportunities."
     else:
         lead_risk = risks[0]
         risk_sentence = (
-            f"Review {lead_risk['date']} before publishing because "
+            f"Priority review: check {lead_risk['date']} before publishing because "
             f"{lead_risk['review_flags'][0].rstrip('.') if lead_risk['review_flags'] else 'the date carries elevated pricing risk'}."
         )
+    publish_fallback = metrics.get(
+        "dates_with_remaining_room_upside",
+        metrics.get("dates_with_sellable_opportunity", 0),
+    )
     summary_sentence = (
-        f"Across the next {metrics.get('dates_evaluated', 0)} days, "
-        f"{metrics.get('dates_with_upside', 0)} dates show upside and "
-        f"{metrics.get('dates_needing_review', 0)} need review."
+        f"Action queue: {queue_counts.get('publish', publish_fallback)} publish, "
+        f"{queue_counts.get('priority_review', metrics.get('priority_review_dates', 0))} priority review, "
+        f"{queue_counts.get('routine_watch', metrics.get('routine_watch_dates', 0))} routine watch, and "
+        f"{queue_counts.get('rate_protection', metrics.get('rate_protection_dates', 0))} rate protection dates."
     )
     return f"{opportunity_sentence} {risk_sentence} {summary_sentence}"
 
@@ -422,16 +639,16 @@ def generate_executive_briefing(payload: Dict[str, Any]) -> str:
 You are writing the morning executive briefing for a single-property hotel manager.
 Use only the supplied structured data. Do not invent prices, do not change ADR, and do not recommend replacement rates.
 Write 2-3 concise sentences covering:
-1. the most important revenue opportunity,
-2. the most important review risk,
-3. the overall 30-day picture.
+1. the most important publish action or remaining-room opportunity,
+2. the most important priority review or rate-protection action,
+3. the action queue counts.
   Keep the tone crisp, commercial, and manager-friendly. Avoid technical jargon.
   Refer to the already-calculated recommendations; do not say "raise rates" or "lower rates."
   Use the "$" symbol whenever you mention money, with no spaces after it and comma separators where needed (for example, "$538" and "$4,205").
-  When describing upside, say "versus booked ADR," not "versus bookings."
+  When describing opportunity, prioritize remaining sellable rooms. Use "modeled lift versus booked ADR" only for secondary diagnostics.
   Do not use markdown, code formatting, or bullet points.
   Do not use terms such as raw OTB, retained OTB, retained occupancy, compression, or overexposure.
-  Keep the three counts separate: dates with upside, dates needing review, and sold-out dates.
+  Keep the action queue counts separate: publish, priority review, routine watch, and rate protection.
 
 Structured data:
 {json.dumps(payload, ensure_ascii=False)}

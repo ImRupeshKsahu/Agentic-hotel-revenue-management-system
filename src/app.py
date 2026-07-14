@@ -33,6 +33,7 @@ from copilot_core.manager import (
     build_opportunity_records,
     build_summary_metrics,
     generate_executive_briefing,
+    rank_rate_protection_dates,
     rank_top_opportunities,
     rank_top_risks,
 )
@@ -93,15 +94,46 @@ def load_live_market_state_cached(json_path, otb_path, forecast_path, market_pat
             cached_state = json.load(f)
         if cached_state and all("adjusted_otb_occupancy" in entry for entry in cached_state.values()):
             booked_adr_by_date = {}
+            otb_overlay_by_date = {}
             if os.path.exists(otb_path):
-                otb_adr_df = pd.read_csv(otb_path, usecols=["Date", "OTB_ADR"])
+                otb_adr_df = pd.read_csv(otb_path)
                 otb_adr_df["Date"] = pd.to_datetime(otb_adr_df["Date"])
                 booked_adr_by_date = {
                     row.Date.strftime("%Y-%m-%d"): float(row.OTB_ADR)
                     for row in otb_adr_df.itertuples(index=False)
+                    if hasattr(row, "OTB_ADR")
                     if pd.notna(row.OTB_ADR)
                 }
+                if otb_mtime > json_mtime:
+                    for row in otb_adr_df.itertuples(index=False):
+                        total_rooms = max(float(getattr(row, "Capacity", BASE_CAPACITY) or BASE_CAPACITY), 1.0)
+                        live_otb = float(getattr(row, "Live_OTB", 0.0))
+                        adjusted_otb = float(getattr(row, "Adjusted_OTB", live_otb))
+                        gross_pace_index = float(getattr(row, "Gross_Pace_Index", getattr(row, "Booking_Velocity", 1.0)))
+                        otb_overlay_by_date[row.Date.strftime("%Y-%m-%d")] = {
+                            "current_otb": live_otb,
+                            "raw_otb_occupancy": live_otb / total_rooms,
+                            "stayover_otb": float(getattr(row, "Stayover_OTB", 0.0)),
+                            "future_arrival_otb": float(getattr(row, "Future_Arrival_OTB", live_otb)),
+                            "adjusted_otb": adjusted_otb,
+                            "expected_cancellations": float(getattr(row, "Expected_Cancellations", 0.0)),
+                            "adjusted_otb_occupancy": float(getattr(row, "Adjusted_OTB_Occupancy", adjusted_otb / total_rooms)),
+                            "historical_avg_otb": int(getattr(row, "Historical_Avg_OTB", 1)),
+                            "booked_adr": float(getattr(row, "OTB_ADR", 0.0)),
+                            "total_rooms": int(total_rooms),
+                            "gross_otb": int(getattr(row, "Gross_OTB", live_otb)),
+                            "net_pickup_7d": int(getattr(row, "Net_Pickup_7d", 0)),
+                            "historical_net_pickup_7d": int(getattr(row, "Historical_Net_Pickup_7d", 0)),
+                            "gross_pace_index": gross_pace_index,
+                            "retained_pace_index": float(getattr(row, "Retained_Pace_Index", gross_pace_index)),
+                            "pickup_trend_index": float(getattr(row, "Pickup_Trend_Index", gross_pace_index)),
+                            "pricing_pace_index": float(getattr(row, "Pricing_Pace_Index", gross_pace_index)),
+                            "booking_velocity": gross_pace_index,
+                            "pace_confidence": getattr(row, "Pace_Confidence", "low"),
+                        }
             for date_key, entry in cached_state.items():
+                if date_key in otb_overlay_by_date:
+                    entry.update(otb_overlay_by_date[date_key])
                 total_rooms = float(entry.get("total_rooms", BASE_CAPACITY) or BASE_CAPACITY)
                 entry.setdefault(
                     "raw_otb_occupancy",
@@ -339,13 +371,144 @@ def format_pct(value):
     return f"{float(value) * 100:.1f}%"
 
 
-def build_revenue_upside_basis_text(record):
+def format_room_count(value):
+    if value is None or pd.isna(value):
+        value = 0.0
+    return f"{float(value):,.0f}"
+
+
+def safe_float(value, fallback=0.0):
+    try:
+        if value is None or pd.isna(value):
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def format_money(value):
+    return f"${safe_float(value):,.0f}"
+
+
+def format_pace(value):
+    return f"{safe_float(value, 1.0):.2f}x"
+
+
+def value_from_sources(key, primary, secondary=None, diagnostics=None, breakdown=None, fallback=0.0):
+    for source in (primary, secondary, diagnostics, breakdown):
+        if isinstance(source, dict) and source.get(key) is not None:
+            return source.get(key)
+    return fallback
+
+
+def nearest_candidate_for_price(candidates, price):
+    if price is None:
+        return {}
+    finite_candidates = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("price") is not None
+    ]
+    if not finite_candidates:
+        return {}
+    return min(
+        finite_candidates,
+        key=lambda candidate: (
+            abs(safe_float(candidate.get("price")) - safe_float(price)),
+            safe_float(candidate.get("price")),
+        ),
+    )
+
+
+def scenario_remaining_room_metric(agent_result, scenario_state=None):
+    scenario_state = scenario_state or {}
+    breakdown = agent_result.get("pricing_breakdown", {}) or {}
+    diagnostics = agent_result.get("optimizer_diagnostics", {}) or {}
+    candidates = breakdown.get("optimizer_candidates", []) or []
+    selected_candidate = breakdown.get("selected_candidate") or diagnostics.get("selected_candidate") or {}
+    booked_adr = scenario_state.get("booked_adr", scenario_state.get("otb_adr"))
+    booked_candidate = nearest_candidate_for_price(candidates, booked_adr)
+    selected_revenue = selected_candidate.get(
+        "candidate_remaining_revenue",
+        diagnostics.get("candidate_remaining_revenue"),
+    )
+    booked_revenue = booked_candidate.get("candidate_remaining_revenue")
+    if selected_revenue is not None and booked_revenue is not None:
+        return "Remaining-Room Opportunity", max(0.0, safe_float(selected_revenue) - safe_float(booked_revenue))
+    fallback_revenue = value_from_sources(
+        "candidate_remaining_revenue",
+        diagnostics,
+        breakdown,
+        fallback=value_from_sources("remaining_revenue", diagnostics, breakdown, fallback=0.0),
+    )
+    return "Remaining-Room Revenue", max(0.0, safe_float(fallback_revenue))
+
+
+def build_scenario_decision_record(agent_result, scenario_state=None):
+    scenario_state = scenario_state or agent_result.get("market_state") or {}
+    breakdown = agent_result.get("pricing_breakdown", {}) or {}
+    diagnostics = agent_result.get("optimizer_diagnostics", {}) or {}
+    total_rooms = max(
+        safe_float(
+            value_from_sources("total_rooms", scenario_state, agent_result, diagnostics, breakdown, fallback=BASE_CAPACITY),
+            BASE_CAPACITY,
+        ),
+        1.0,
+    )
+    current_otb = safe_float(
+        scenario_state.get("current_otb"),
+        safe_float(diagnostics.get("raw_otb_occupancy"), 0.0) * total_rooms,
+    )
+    adjusted_otb = safe_float(
+        scenario_state.get("adjusted_otb"),
+        value_from_sources("retained_rooms", diagnostics, breakdown, fallback=current_otb),
+    )
+    remaining_label, remaining_value = scenario_remaining_room_metric(agent_result, scenario_state)
+    return {
+        "recommended_action": agent_result.get(
+            "ai_recommended_action",
+            agent_result.get("strategy_applied", "Review Before Publishing"),
+        ),
+        "recommended_adr": agent_result.get("final_adr", agent_result.get("optimized_price", 0.0)),
+        "remaining_room_metric_label": remaining_label,
+        "remaining_room_opportunity": remaining_value,
+        "sellable_rooms": value_from_sources("sellable_rooms", diagnostics, breakdown, fallback=max(0.0, total_rooms - adjusted_otb)),
+        "current_otb": current_otb,
+        "adjusted_otb": adjusted_otb,
+        "forecasted_occupancy": value_from_sources("forecasted_occupancy", agent_result, scenario_state, breakdown, fallback=0.0),
+        "gross_pace_index": value_from_sources("gross_pace_index", agent_result, scenario_state, breakdown, fallback=1.0),
+        "pickup_trend_index": value_from_sources("pickup_trend_index", agent_result, scenario_state, breakdown, fallback=1.0),
+        "pricing_pace_index": value_from_sources("pricing_pace_index", agent_result, scenario_state, breakdown, fallback=1.0),
+    }
+
+
+def render_date_decision_kpis(record, agent_result=None):
+    diagnostics = (agent_result or {}).get("optimizer_diagnostics", {}) if agent_result else {}
+    breakdown = (agent_result or {}).get("pricing_breakdown", {}) if agent_result else {}
+    metric_label = record.get("remaining_room_metric_label", "Remaining-Room Opportunity")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Recommended Action", record.get("recommended_action", "Review"))
+    c2.metric("Recommended ADR", f"${safe_float(record.get('recommended_adr')):.2f}")
+    c3.metric(metric_label, format_money(record.get("remaining_room_opportunity", 0.0)))
+    c4.metric("Sellable Rooms", format_room_count(value_from_sources("sellable_rooms", record, diagnostics, breakdown, fallback=0.0)))
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Current OTB", format_room_count(value_from_sources("current_otb", record, diagnostics, breakdown, fallback=0.0)))
+    c6.metric("Likely Retained OTB", format_room_count(value_from_sources("adjusted_otb", record, diagnostics, breakdown, fallback=0.0)))
+    c7.metric("ML Forecast Occupancy", format_pct(value_from_sources("forecasted_occupancy", record, agent_result or {}, breakdown, fallback=0.0)))
+    c8, c9, c10 = st.columns(3)
+    c8.metric("Booking Pace", format_pace(value_from_sources("gross_pace_index", record, agent_result or {}, breakdown, fallback=1.0)))
+    c9.metric("Recent Pickup", format_pace(value_from_sources("pickup_trend_index", record, agent_result or {}, breakdown, fallback=1.0)))
+    c10.metric("Pricing Pace", format_pace(value_from_sources("pricing_pace_index", record, agent_result or {}, breakdown, fallback=1.0)))
+
+
+def build_opportunity_basis_text(record):
     return (
-        f"Upside basis: recommended ADR ${record['recommended_adr']:.2f} × "
-        f"{record['expected_rooms']:.2f} expected rooms = ${record['expected_revenue']:,.2f}; "
-        f"booked ADR ${record['booked_adr']:.2f} maps to nearest optimizer candidate "
-        f"${record['booked_adr_proxy_price']:.2f} × {record['booked_adr_proxy_expected_rooms']:.2f} "
-        f"expected rooms = ${record['booked_adr_revenue_proxy']:,.2f}."
+        f"Remaining-room basis: {format_room_count(record['adjusted_otb'])} retained rooms leave "
+        f"{format_room_count(record['sellable_rooms'])} sellable rooms; recommended ADR ${record['recommended_adr']:.2f} "
+        f"captures ${record['candidate_remaining_revenue']:,.2f} remaining-room revenue versus "
+        f"${record['booked_adr_remaining_revenue_proxy']:,.2f} at the booked-ADR proxy. "
+        f"Modeled lift basis: recommended ADR total modeled revenue ${record['expected_revenue']:,.2f} "
+        f"versus booked ADR proxy total modeled revenue ${record['booked_adr_revenue_proxy']:,.2f}."
     )
 
 
@@ -354,13 +517,15 @@ def build_today_snapshot_rows(records):
         {
             "Date": row["date"],
             "ADR": f"${row['recommended_adr']:.2f}",
-            "Booked": format_pct(row["raw_otb_occupancy"]),
-            "Expected Cancellations": f"{row['expected_cancellations']:.2f}",
-            "Likely Retained": format_pct(row["adjusted_otb_occupancy"]),
-            "Forecast": format_pct(row["forecasted_occupancy"]),
+            "Current OTB": format_room_count(row["current_otb"]),
+            "Expected Cancellations": format_room_count(row["expected_cancellations"]),
+            "Likely Retained OTB": format_room_count(row["adjusted_otb"]),
+            "ML Forecast Occupancy": format_pct(row["forecasted_occupancy"]),
+            "Sellable Rooms": format_room_count(row["sellable_rooms"]),
             "Pickup": f"{row['pickup_trend_index']:.2f}x",
             "Comp Median": f"${row['competitor_median']:.2f}",
-            "Upside vs Booked ADR": f"${row['revenue_upside']:,.0f}",
+            "Remaining-Room Opportunity": f"${row['remaining_room_opportunity']:,.0f}",
+            "Modeled Lift vs Booked ADR": f"${row['modeled_lift_vs_booked_adr']:,.0f}",
             "Review Status": row["review_status"],
         }
         for row in records
@@ -371,11 +536,29 @@ def build_manager_table_rows(records):
     return [
         {
             "Date": row["date"],
-            "ADR": f"${row['recommended_adr']:.2f}",
-            "Upside vs Booked ADR": f"${row['revenue_upside']:,.0f}",
-            "Booked": format_pct(row["raw_otb_occupancy"]),
-            "Forecast": format_pct(row["forecasted_occupancy"]),
+            "Recommended Action": row["recommended_action"],
+            "Recommended ADR": f"${row['recommended_adr']:.2f}",
+            "Sellable Rooms": format_room_count(row["sellable_rooms"]),
+            "Remaining-Room Opportunity": f"${row['remaining_room_opportunity']:,.0f}",
+            "Current OTB": format_room_count(row["current_otb"]),
+            "Likely Retained OTB": format_room_count(row["adjusted_otb"]),
+            "Competitor Median": f"${row['competitor_median']:.2f}",
             "Why it matters": " ".join(row["top_reasons"]),
+        }
+        for row in records
+    ]
+
+
+def build_rate_protection_table_rows(records):
+    return [
+        {
+            "Date": row["date"],
+            "Recommended ADR": f"${row['recommended_adr']:.2f}",
+            "Current OTB": format_room_count(row["current_otb"]),
+            "Likely Retained OTB": format_room_count(row["adjusted_otb"]),
+            "Expected Cancellations": format_room_count(row["expected_cancellations"]),
+            "Modeled Lift vs Booked ADR": f"${row['modeled_lift_vs_booked_adr']:,.0f}",
+            "Review Reason": " ".join((row.get("review_flags") or row.get("top_reasons") or [])[:2]),
         }
         for row in records
     ]
@@ -389,17 +572,165 @@ def executive_briefing_cached(payload_json, policy_version):
     return generate_executive_briefing(json.loads(payload_json))
 
 
+PRICE_WATERFALL_REQUIRED_DRIVERS = ["Base rate", "Reference price", "Candidate optimization", "Final recommendation"]
+PRICE_WATERFALL_DRIVER_ORDER = ["Base rate", "Reference price", "Candidate optimization", "Sold-out floor", "Final recommendation"]
+PRICE_CHANGE_TOLERANCE = 0.005
+
+
+def _price_component_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_component_changed(adjustment):
+    return abs(float(adjustment)) > PRICE_CHANGE_TOLERANCE
+
+
+def build_price_waterfall_rows(agent_result):
+    breakdown = agent_result.get("pricing_breakdown", {}) or {}
+    components = breakdown.get("components", []) or []
+    component_by_driver = {
+        component.get("driver"): component
+        for component in components
+        if isinstance(component, dict)
+    }
+    if any(driver not in component_by_driver for driver in PRICE_WATERFALL_REQUIRED_DRIVERS):
+        return []
+
+    rows = []
+    for driver in PRICE_WATERFALL_DRIVER_ORDER:
+        if driver == "Final recommendation":
+            continue
+        component = component_by_driver.get(driver)
+        if not component:
+            continue
+        adjustment = _price_component_float(component.get("adjustment"))
+        price_after = _price_component_float(component.get("price_after"))
+        if adjustment is None or price_after is None:
+            return []
+        if driver != "Base rate" and not _price_component_changed(adjustment):
+            continue
+        measure = "relative"
+        amount = adjustment
+        if driver == "Base rate":
+            measure = "absolute"
+            amount = price_after
+        rows.append(
+            {
+                "Driver": driver,
+                "Measure": measure,
+                "Amount": amount,
+                "Adjustment": adjustment,
+                "Adjustment Label": f"${adjustment:+,.2f}",
+                "Price After": price_after,
+                "Why": component.get("explanation", ""),
+            }
+        )
+    final_component = component_by_driver["Final recommendation"]
+    final_adjustment = _price_component_float(final_component.get("adjustment"))
+    final_price_after = _price_component_float(final_component.get("price_after"))
+    if final_adjustment is None or final_price_after is None:
+        return []
+    if _price_component_changed(final_adjustment):
+        rows.append(
+            {
+                "Driver": "Dynamic safety bounds",
+                "Measure": "relative",
+                "Amount": final_adjustment,
+                "Adjustment": final_adjustment,
+                "Adjustment Label": f"${final_adjustment:+,.2f}",
+                "Price After": final_price_after,
+                "Why": final_component.get("explanation", ""),
+            }
+        )
+    rows.append(
+        {
+            "Driver": "Final recommendation",
+            "Measure": "total",
+            "Amount": final_price_after,
+            "Adjustment": 0.0,
+            "Adjustment Label": "Final ADR",
+            "Price After": final_price_after,
+            "Why": final_component.get("explanation", "Final ADR after deterministic pricing path."),
+        }
+    )
+    return rows
+
+
+def build_price_path_table_rows(agent_result):
+    waterfall_rows = build_price_waterfall_rows(agent_result)
+    return [
+        {
+            "Driver": row["Driver"],
+            "Adjustment": row["Adjustment Label"],
+            "Price After": f"${row['Price After']:,.2f}",
+            "Why": row["Why"],
+        }
+        for row in waterfall_rows
+    ]
+
+
+def render_price_waterfall(agent_result):
+    waterfall_rows = build_price_waterfall_rows(agent_result)
+    if not waterfall_rows:
+        return
+
+    fig = go.Figure(
+        go.Waterfall(
+            orientation="v",
+            measure=[row["Measure"] for row in waterfall_rows],
+            x=[row["Driver"] for row in waterfall_rows],
+            y=[row["Amount"] for row in waterfall_rows],
+            text=[f"${row['Price After']:,.2f}" for row in waterfall_rows],
+            textposition="outside",
+            customdata=[
+                [
+                    row["Adjustment Label"],
+                    f"${row['Price After']:,.2f}",
+                    row["Why"],
+                ]
+                for row in waterfall_rows
+            ],
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Adjustment: %{customdata[0]}<br>"
+                "Price after: %{customdata[1]}<br>"
+                "%{customdata[2]}<extra></extra>"
+            ),
+            connector={"line": {"color": "#94A3B8"}},
+            increasing={"marker": {"color": "#0F766E"}},
+            decreasing={"marker": {"color": "#DC2626"}},
+            totals={"marker": {"color": "#2563EB"}},
+        )
+    )
+    fig.update_layout(
+        title="Deterministic Price Path",
+        yaxis_title="ADR ($)",
+        showlegend=False,
+        height=360,
+        margin=dict(l=20, r=20, t=60, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_price_trace(agent_result):
     st.subheader("Price Path")
-    price_path_components = agent_result.get("price_path_components", agent_result.get("price_components", []))
-    if price_path_components:
-        st.dataframe(pd.DataFrame(price_path_components), use_container_width=True, hide_index=True)
+    render_price_waterfall(agent_result)
+    price_path_rows = build_price_path_table_rows(agent_result)
+    if price_path_rows:
+        st.dataframe(pd.DataFrame(price_path_rows), use_container_width=True, hide_index=True)
     else:
-        fallback_rows = [
-            {"Driver": "Base rate", "Adjustment": "$+0.00", "Price After": f"${BASE_PRICE:.2f}", "Why": "Starting public rate."},
-            {"Driver": "Optimizer ADR", "Adjustment": f"${agent_result['final_adr'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Deterministic candidate-price optimizer output."},
-        ]
-        st.dataframe(pd.DataFrame(fallback_rows), use_container_width=True, hide_index=True)
+        price_path_components = agent_result.get("price_path_components", agent_result.get("price_components", []))
+        if price_path_components:
+            st.dataframe(pd.DataFrame(price_path_components), use_container_width=True, hide_index=True)
+        else:
+            fallback_rows = [
+                {"Driver": "Base rate", "Adjustment": "$+0.00", "Price After": f"${BASE_PRICE:.2f}", "Why": "Starting public rate."},
+                {"Driver": "Optimizer ADR", "Adjustment": f"${agent_result['final_adr'] - BASE_PRICE:+.2f}", "Price After": f"${agent_result['final_adr']:.2f}", "Why": "Deterministic candidate-price optimizer output."},
+            ]
+            st.dataframe(pd.DataFrame(fallback_rows), use_container_width=True, hide_index=True)
 
     st.subheader("Decision Context")
     decision_context_components = agent_result.get("decision_context_components", [])
@@ -419,11 +750,29 @@ def render_price_trace(agent_result):
 
 def render_technical_trace(agent_result, use_expander=True):
     def render_trace_body():
+        diagnostics = agent_result.get("optimizer_diagnostics", {})
         st.write(f"**Applied Logic Flags:** {agent_result.get('logic_flags', [])}")
         st.write(f"**Forecasted Occupancy:** {agent_result.get('forecasted_occupancy', 0) * 100:.1f}%")
-        st.write(f"**Optimizer Diagnostics:** {agent_result.get('optimizer_diagnostics', {})}")
+        st.write(f"**Optimizer Diagnostics:** {diagnostics}")
+        st.write(f"**Selected Objective:** {diagnostics.get('selected_objective', 'n/a')}")
+        candidate_rows = []
+        for candidate in diagnostics.get("top_candidates", []):
+            candidate_rows.append(
+                {
+                    "ADR": f"${float(candidate.get('price', 0.0)):.2f}",
+                    "Expected Occupancy": format_pct(candidate.get("expected_occupancy", 0.0)),
+                    "Modeled Total Rooms": format_room_count(candidate.get("modeled_total_rooms", candidate.get("expected_rooms", 0.0))),
+                    "Retained Rooms": format_room_count(candidate.get("retained_rooms", 0.0)),
+                    "Remaining Rooms": format_room_count(candidate.get("candidate_remaining_rooms", candidate.get("remaining_rooms", 0.0))),
+                    "Remaining Revenue": f"${float(candidate.get('candidate_remaining_revenue', candidate.get('remaining_revenue', 0.0))):,.2f}",
+                    "Modeled Total Revenue": f"${float(candidate.get('modeled_total_revenue', candidate.get('expected_revenue', 0.0))):,.2f}",
+                    "Selected": "Yes" if candidate.get("selected") else "No",
+                }
+            )
+        if candidate_rows:
+            st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, hide_index=True)
         st.write(f"**Market Context:** {agent_result.get('market_context', {})}")
-        st.write(f"**Sold-Out Compression:** {agent_result.get('optimizer_diagnostics', {}).get('sold_out', False)}")
+        st.write(f"**Sold-Out Compression:** {diagnostics.get('sold_out', False)}")
         st.write(f"**AI Recommended Action:** {agent_result.get('ai_recommended_action', 'n/a')}")
         st.write(f"**AI Risk Level:** {agent_result.get('ai_risk_level', 'n/a')}")
         st.write(f"**AI Review Flags:** {agent_result.get('ai_review_flags', [])}")
@@ -443,17 +792,20 @@ def render_technical_trace(agent_result, use_expander=True):
 
 
 def render_scenario_result(agent_result, scenario_state=None, technical_expander=True):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Final ADR", f"${agent_result.get('final_adr', 0.0):.2f}")
-    c2.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
-    c3.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
-    c4.metric("Pricing Pace", f"{agent_result.get('pricing_pace_index', 1.0)}x")
+    result_state = scenario_state or agent_result.get("market_state") or {}
+    scenario_record = build_scenario_decision_record(agent_result, result_state)
+    render_date_decision_kpis(scenario_record, agent_result)
+
+    risk_label = agent_result.get("ai_risk_level", "Medium")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("ADR vs Reference", f"{agent_result.get('pct_delta_from_reference', 0):+.2f}%", f"${agent_result.get('absolute_delta', 0):+.2f}")
+    d2.metric("Market Gap", f"{agent_result.get('competitor_gap_pct', 0):+.2f}%")
+    d3.metric("Risk", risk_label)
 
     st.markdown("---")
 
     st.subheader("AI Advisory Briefing")
     action_label = agent_result.get("ai_recommended_action", agent_result.get("strategy_applied", "Review Before Publishing"))
-    risk_label = agent_result.get("ai_risk_level", "Medium")
     banner_text = f"{action_label} | Risk: {risk_label}"
     if action_label == "Accept Optimizer Price":
         st.success(banner_text)
@@ -463,16 +815,15 @@ def render_scenario_result(agent_result, scenario_state=None, technical_expander
         st.warning(banner_text)
     st.info(escape_streamlit_markdown(normalize_reasoning(agent_result.get("strategic_reasoning", ""))))
 
-    result_state = scenario_state or agent_result.get("market_state") or {}
     if result_state:
-        scenario_record = {
+        booking_quality_record = {
             "current_otb": float(result_state.get("current_otb", 0.0)),
             "expected_cancellations": float(
                 result_state.get("expected_cancellations", agent_result.get("expected_cancellations", 0.0))
             ),
             "adjusted_otb": float(result_state.get("adjusted_otb", result_state.get("current_otb", 0.0))),
         }
-        render_selected_booking_quality(scenario_record)
+        render_selected_booking_quality(booking_quality_record)
 
     render_technical_trace(agent_result, use_expander=technical_expander)
     render_price_trace(agent_result)
@@ -590,10 +941,10 @@ def build_booking_quality_plot_df(records):
         rows.append(
             {
                 "Date": pd.to_datetime(row["date"]),
-                "Booked Rooms": float(row.get("current_otb", 0.0)),
-                "Stayover Rooms": float(row.get("stayover_otb", 0.0)),
-                "Future Arrival Rooms": float(row.get("future_arrival_otb", row.get("current_otb", 0.0))),
-                "Likely Retained Rooms": float(row.get("adjusted_otb", 0.0)),
+                "Booked Rooms": round(float(row.get("current_otb", 0.0))),
+                "Stayover Rooms": round(float(row.get("stayover_otb", 0.0))),
+                "Future Arrival Rooms": round(float(row.get("future_arrival_otb", row.get("current_otb", 0.0)))),
+                "Likely Retained Rooms": round(float(row.get("adjusted_otb", 0.0))),
                 "Forecast Rooms": min(round(float(row.get("forecasted_occupancy", 0.0)) * total_rooms), total_rooms),
             }
         )
@@ -611,9 +962,9 @@ def render_booking_quality_trend(records):
             line=dict(color="#2563EB", width=3),
             customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
             hovertemplate=(
-                "Booked Rooms: %{y:.2f}<br>"
-                "Stayover Rooms: %{customdata[0]:.2f}<br>"
-                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+                "Booked Rooms: %{y:.0f}<br>"
+                "Stayover Rooms: %{customdata[0]:.0f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.0f}<extra></extra>"
             ),
         )
     )
@@ -625,9 +976,9 @@ def render_booking_quality_trend(records):
             line=dict(color="#0F766E", width=3),
             customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
             hovertemplate=(
-                "Likely Retained Rooms: %{y:.2f}<br>"
-                "Stayover Rooms: %{customdata[0]:.2f}<br>"
-                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+                "Likely Retained Rooms: %{y:.0f}<br>"
+                "Stayover Rooms: %{customdata[0]:.0f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.0f}<extra></extra>"
             ),
         )
     )
@@ -639,9 +990,9 @@ def render_booking_quality_trend(records):
             line=dict(color="#F59E0B", width=3, dash="dot"),
             customdata=plot_df[["Stayover Rooms", "Future Arrival Rooms"]],
             hovertemplate=(
-                "Forecast Rooms: %{y:.2f}<br>"
-                "Stayover Rooms: %{customdata[0]:.2f}<br>"
-                "Future Arrival Rooms: %{customdata[1]:.2f}<extra></extra>"
+                "Forecast Rooms: %{y:.0f}<br>"
+                "Stayover Rooms: %{customdata[0]:.0f}<br>"
+                "Future Arrival Rooms: %{customdata[1]:.0f}<extra></extra>"
             ),
         )
     )
@@ -656,16 +1007,16 @@ def render_booking_quality_trend(records):
 
 def render_selected_booking_quality(record):
     values = [
-        float(record.get("current_otb", 0.0)),
-        float(record.get("expected_cancellations", 0.0)),
-        float(record.get("adjusted_otb", 0.0)),
+        round(float(record.get("current_otb", 0.0))),
+        round(float(record.get("expected_cancellations", 0.0))),
+        round(float(record.get("adjusted_otb", 0.0))),
     ]
     fig = go.Figure(
         go.Bar(
-            x=["Current Booked", "Expected Cancellations", "Likely Retained"],
+            x=["Current OTB", "Expected Cancellations", "Likely Retained OTB"],
             y=values,
             marker_color=["#2563EB", "#DC2626", "#0F766E"],
-            text=[f"{value:.2f}" for value in values],
+            text=[format_room_count(value) for value in values],
             textposition="outside",
         )
     )
@@ -679,6 +1030,50 @@ def render_selected_booking_quality(record):
         "Cancellation risk is estimated only for not-yet-arrived bookings using remaining days to arrival, lead time, "
         "segment, channel, and customer type; in-house stayovers are treated as retained."
     )
+
+
+def render_decision_rationale(record, agent_result):
+    diagnostics = agent_result.get("optimizer_diagnostics", {})
+    pricing_mode = record.get("pricing_mode") or diagnostics.get("pricing_mode", "remaining_room_optimization")
+    if pricing_mode == "rate_protection" or float(record.get("sellable_rooms", 0.0)) <= 0:
+        primary_basis = "Rate protection: no sellable rooms remain."
+    else:
+        primary_basis = (
+            f"${record['remaining_room_opportunity']:,.0f} remaining-room opportunity across "
+            f"{format_room_count(record['sellable_rooms'])} sellable rooms."
+        )
+    review_note = (
+        record["review_flags"][0]
+        if record.get("review_flags")
+        else "No priority review flag for this date."
+    )
+    rows = [
+        {
+            "Decision Area": "Action",
+            "Manager View": record["recommended_action"],
+            "Data Basis": primary_basis,
+        },
+        {
+            "Decision Area": "Inventory",
+            "Manager View": (
+                f"{format_room_count(record['current_otb'])} current OTB, "
+                f"{format_room_count(record['adjusted_otb'])} likely retained"
+            ),
+            "Data Basis": f"{format_room_count(record['expected_cancellations'])} expected cancellations.",
+        },
+        {
+            "Decision Area": "Market",
+            "Manager View": f"Recommended ADR ${record['recommended_adr']:.2f}",
+            "Data Basis": f"Competitor median ${record['competitor_median']:.2f}; booked ADR ${record['booked_adr']:.2f}.",
+        },
+        {
+            "Decision Area": "Review",
+            "Manager View": record.get("review_priority", record.get("review_status", "No review")),
+            "Data Basis": review_note,
+        },
+    ]
+    st.subheader("Decision Rationale")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def render_pricing_vs_market_chart(records):
@@ -749,6 +1144,7 @@ if app_mode == "Morning Briefing":
     live_data = load_live_market_data()
     opportunity_records = build_opportunity_records(forecast_df, live_data)
     top_opportunities = rank_top_opportunities(opportunity_records)
+    top_rate_protection = rank_rate_protection_dates(opportunity_records)
     top_risks = rank_top_risks(opportunity_records)
     summary_metrics = build_summary_metrics(opportunity_records)
     briefing_payload = build_briefing_payload(opportunity_records)
@@ -758,16 +1154,15 @@ if app_mode == "Morning Briefing":
     st.info(escape_streamlit_markdown(normalize_reasoning(briefing)))
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Revenue Upside", f"${summary_metrics['total_revenue_upside']:,.0f}")
-    c2.metric("Dates With Upside", summary_metrics["dates_with_upside"])
-    c3.metric("Dates Needing Review", summary_metrics["dates_needing_review"])
-    c4.metric("Sold-Out Dates", summary_metrics["sold_out_dates"])
+    c1.metric("Total Remaining-Room Opportunity", f"${summary_metrics['total_remaining_room_opportunity']:,.0f}")
+    c2.metric("Dates With Remaining-Room Upside", summary_metrics["dates_with_remaining_room_upside"])
+    c3.metric("Priority Review Dates", summary_metrics["priority_review_dates"])
+    c4.metric("Rate Protection Dates", summary_metrics["rate_protection_dates"])
 
-    render_booking_quality_trend(opportunity_records)
-
+    st.subheader("Action Queue")
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Top Revenue Opportunities")
+        st.subheader("Top Sellable-Room Opportunities")
         if top_opportunities:
             st.dataframe(
                 pd.DataFrame(build_manager_table_rows(top_opportunities)),
@@ -775,22 +1170,37 @@ if app_mode == "Morning Briefing":
                 hide_index=True,
             )
         else:
-            st.success("No material revenue upside stands out right now.")
+            st.success("No material sellable-room opportunity stands out right now.")
     with c2:
-        st.subheader("Top Risks / Review Needed")
-        if top_risks:
-            risk_rows = [
-                {
-                    "Date": row["date"],
-                    "ADR": f"${row['recommended_adr']:.2f}",
-                    "Review Status": row["review_status"],
-                    "Why review": " ".join(row["review_flags"][:2]),
-                }
-                for row in top_risks
-            ]
-            st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+        st.subheader("Rate Protection / Review Dates")
+        if top_rate_protection:
+            st.dataframe(
+                pd.DataFrame(build_rate_protection_table_rows(top_rate_protection)),
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
-            st.success("No dates currently require special review before publishing.")
+            st.success("No dates are currently in rate-protection mode.")
+
+    st.subheader("Priority Reviews / Watch Dates")
+    if top_risks:
+        risk_rows = [
+            {
+                "Date": row["date"],
+                "ADR": f"${row['recommended_adr']:.2f}",
+                "Recommended Action": row["recommended_action"],
+                "Review Priority": row.get("review_priority", "Priority review"),
+                "Review Status": row["review_status"],
+                "Remaining-Room Opportunity": f"${row['remaining_room_opportunity']:,.0f}",
+                "Why review": " ".join(row["review_flags"][:2]),
+            }
+            for row in top_risks
+        ]
+        st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("No dates currently require special review before publishing.")
+
+    render_booking_quality_trend(opportunity_records)
 
     st.subheader("30-Day Snapshot")
     st.dataframe(
@@ -801,7 +1211,13 @@ if app_mode == "Morning Briefing":
     )
 
     inspectable_dates = [record["date"] for record in opportunity_records]
-    default_date = top_opportunities[0]["date"] if top_opportunities else inspectable_dates[0]
+    default_date = (
+        top_opportunities[0]["date"]
+        if top_opportunities
+        else top_rate_protection[0]["date"]
+        if top_rate_protection
+        else inspectable_dates[0]
+    )
     selected_date = st.selectbox(
         "Inspect date",
         inspectable_dates,
@@ -834,29 +1250,26 @@ if app_mode == "Morning Briefing":
         market_state=selected_state,
         raw_otb_occupancy=selected_record["raw_otb_occupancy"],
         adjusted_otb_occupancy=selected_record["adjusted_otb_occupancy"],
-        expected_cancellations=float(selected_state.get("expected_cancellations", 0.0)),
+        expected_cancellations=float(selected_record.get("expected_cancellations", 0.0)),
         record_decision=False,
     )
 
     st.subheader(f"Date Detail — {selected_date}")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Recommended ADR", f"${selected_record['recommended_adr']:.2f}")
-    c2.metric("Current Booked", format_pct(selected_record["raw_otb_occupancy"]))
-    c3.metric("Expected Cancellations", f"{selected_record['expected_cancellations']:.2f}")
-    c4.metric("Likely Retained", format_pct(selected_record["adjusted_otb_occupancy"]))
-    c5.metric("Forecast Occupancy", format_pct(selected_record["forecasted_occupancy"]))
+    render_date_decision_kpis(selected_record, agent_result)
     st.caption(
         escape_streamlit_markdown(
             f"Competitor median: ${selected_record['competitor_median']:.2f} | "
             f"Booked ADR: ${selected_record['booked_adr']:.2f} | "
-            f"Upside vs booked ADR: ${selected_record['revenue_upside']:,.0f} | "
+            f"Modeled lift vs booked ADR: ${selected_record['modeled_lift_vs_booked_adr']:,.0f} | "
+            f"Expected cancellations: {format_room_count(selected_record['expected_cancellations'])} | "
             f"Review status: {selected_record['review_status']} | "
-            f"Stayovers: {selected_record.get('stayover_otb', 0):.0f} | "
-            f"Future arrivals: {selected_record.get('future_arrival_otb', selected_record['current_otb']):.0f}"
+            f"Stayovers: {format_room_count(selected_record.get('stayover_otb', 0))} | "
+            f"Future arrivals: {format_room_count(selected_record.get('future_arrival_otb', selected_record['current_otb']))}"
         )
     )
-    st.caption(escape_streamlit_markdown(build_revenue_upside_basis_text(selected_record)))
+    st.caption(escape_streamlit_markdown(build_opportunity_basis_text(selected_record)))
     render_selected_booking_quality(selected_record)
+    render_decision_rationale(selected_record, agent_result)
     st.info(escape_streamlit_markdown(normalize_reasoning(agent_result["strategic_reasoning"])))
     render_technical_trace(agent_result)
     render_price_trace(agent_result)
@@ -913,6 +1326,8 @@ elif app_mode == "Market Outlook":
             raw_otb_occupancy=float(live_entry.get('current_otb', 0)) / float(live_entry.get('total_rooms', BASE_CAPACITY) or BASE_CAPACITY),
             adjusted_otb_occupancy=adjusted_otb_occupancy(live_entry),
             expected_cancellations=live_entry.get('expected_cancellations', 0.0),
+            total_rooms=live_entry.get('total_rooms', BASE_CAPACITY),
+            adjusted_otb_rooms=live_entry.get('adjusted_otb'),
         )
         
         live_records.append({

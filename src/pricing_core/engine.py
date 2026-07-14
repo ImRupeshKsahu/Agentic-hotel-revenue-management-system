@@ -80,12 +80,20 @@ def normalize_market_context(market_context=None, competitor_price=None):
     }
 
 
-def _candidate_prices(min_price=MIN_PRICE, max_price=MAX_PRICE):
+def _candidate_prices(min_price=MIN_PRICE, max_price=MAX_PRICE, anchors=None):
+    min_price = float(min_price)
+    max_price = max(float(max_price), min_price)
+    prices = {_round_money(min_price), _round_money(max_price)}
     start = int(np.ceil(min_price / PRICE_STEP) * PRICE_STEP)
     end = int(np.floor(max_price / PRICE_STEP) * PRICE_STEP)
-    if end < start:
-        start = end = int(round(float(min_price) / PRICE_STEP) * PRICE_STEP)
-    return [float(price) for price in range(start, end + PRICE_STEP, PRICE_STEP)]
+    if start <= end:
+        prices.update(float(price) for price in range(start, end + PRICE_STEP, PRICE_STEP))
+    for anchor in anchors or []:
+        anchor_price = _finite_float(anchor)
+        if anchor_price is None:
+            continue
+        prices.add(_round_money(max(min_price, min(max_price, anchor_price))))
+    return sorted(price for price in prices if min_price <= price <= max_price)
 
 
 def _is_sold_out(raw_otb_occupancy):
@@ -380,6 +388,38 @@ def _estimate_expected_occupancy(candidate_price, demand_anchor, reference_price
     return max(0.0, min(1.0, float(expected_occ)))
 
 
+def _candidate_room_metrics(candidate_price, expected_occupancy, total_rooms, retained_rooms, sellable_rooms):
+    modeled_total_rooms = expected_occupancy * total_rooms
+    modeled_total_revenue = candidate_price * modeled_total_rooms
+    remaining_rooms = min(sellable_rooms, max(0.0, modeled_total_rooms - retained_rooms))
+    remaining_revenue = candidate_price * remaining_rooms
+    return {
+        "price": _round_money(candidate_price),
+        "expected_occupancy": round(expected_occupancy, 4),
+        "expected_rooms": round(modeled_total_rooms, 2),
+        "expected_revenue": _round_money(modeled_total_revenue),
+        "modeled_total_rooms": round(modeled_total_rooms, 2),
+        "modeled_total_revenue": _round_money(modeled_total_revenue),
+        "retained_rooms": round(retained_rooms, 2),
+        "sellable_rooms": round(sellable_rooms, 2),
+        "remaining_rooms": round(remaining_rooms, 2),
+        "remaining_revenue": _round_money(remaining_revenue),
+        "candidate_remaining_rooms": round(remaining_rooms, 2),
+        "candidate_remaining_revenue": _round_money(remaining_revenue),
+    }
+
+
+def _select_candidate(candidates, objective, prefer_higher_adr):
+    best_value = max(row[objective] for row in candidates)
+    if best_value > 0:
+        near_best = [row for row in candidates if row[objective] >= best_value * 0.99]
+    else:
+        near_best = [row for row in candidates if row[objective] == best_value]
+    if prefer_higher_adr:
+        return max(near_best, key=lambda row: (row["price"], row[objective]))
+    return min(near_best, key=lambda row: (row["price"], -row[objective]))
+
+
 def _manual_review_flags(
     final_price,
     reference_price,
@@ -450,9 +490,12 @@ def calculate_recommended_price(
     raw_otb_occupancy=None,
     adjusted_otb_occupancy=None,
     expected_cancellations=0.0,
+    total_rooms=BASE_CAPACITY,
+    adjusted_otb_rooms=None,
 ):
-    """Select the allowed ADR with the highest expected room revenue."""
+    """Select the allowed ADR with the highest actionable room revenue."""
     occupancy = max(0.0, min(1.0, float(occupancy)))
+    total_rooms = max(_finite_float(total_rooms) or BASE_CAPACITY, 1.0)
     organic_occupancy = occupancy if pre_shock_occupancy is None else max(0.0, min(1.0, float(pre_shock_occupancy)))
     pace_signals = _resolve_pace_signals(
         booking_velocity=booking_velocity,
@@ -474,6 +517,11 @@ def calculate_recommended_price(
         raw_otb_occupancy = max(0.0, min(1.0, raw_otb_occupancy))
     if adjusted_otb_occupancy is not None:
         adjusted_otb_occupancy = max(0.0, min(1.0, adjusted_otb_occupancy))
+    retained_rooms_source = _finite_float(adjusted_otb_rooms)
+    if retained_rooms_source is None and adjusted_otb_occupancy is not None:
+        retained_rooms_source = adjusted_otb_occupancy * total_rooms
+    retained_rooms = max(0.0, min(total_rooms, retained_rooms_source or 0.0))
+    sellable_rooms = max(0.0, total_rooms - retained_rooms)
     expected_cancellations = max(0.0, float(expected_cancellations or 0.0))
     sold_out = _is_sold_out(raw_otb_occupancy)
     applied_rules = []
@@ -543,7 +591,12 @@ def calculate_recommended_price(
         reference_price = max(min_price, min(max_price, reference_price))
 
     candidates = []
-    for candidate in _candidate_prices(min_price, max_price):
+    candidate_prices = _candidate_prices(
+        min_price,
+        max_price,
+        anchors=[reference_price, competitor_price, market_context.get("comp_high")],
+    )
+    for candidate in candidate_prices:
         expected_occupancy = _estimate_expected_occupancy(
             candidate,
             demand_anchor,
@@ -552,18 +605,27 @@ def calculate_recommended_price(
             market_context,
             compression["allowed_premium_pct"],
         )
-        expected_rooms = expected_occupancy * BASE_CAPACITY
-        expected_revenue = candidate * expected_rooms
         candidates.append(
-            {
-                "price": _round_money(candidate),
-                "expected_occupancy": round(expected_occupancy, 4),
-                "expected_rooms": round(expected_rooms, 2),
-                "expected_revenue": _round_money(expected_revenue),
-            }
+            _candidate_room_metrics(
+                candidate,
+                expected_occupancy,
+                total_rooms,
+                retained_rooms,
+                sellable_rooms,
+            )
         )
 
-    selected = max(candidates, key=lambda row: (row["expected_revenue"], row["price"]))
+    pricing_mode = "remaining_room_optimization" if sellable_rooms > 0 else "rate_protection"
+    selected_objective = "candidate_remaining_revenue" if pricing_mode == "remaining_room_optimization" else "modeled_total_revenue"
+    prefer_higher_adr = (
+        sold_out
+        or compression["market_position_regime"] in {"strong_compression", "last_room"}
+        or raw_otb_occupancy is not None
+        and raw_otb_occupancy >= 0.95
+    )
+    selected = _select_candidate(candidates, selected_objective, prefer_higher_adr)
+    for candidate in candidates:
+        candidate["selected"] = candidate["price"] == selected["price"]
     optimized_price = selected["price"]
     recommended_price = optimized_price
     applied_rules.append("Candidate Price Optimizer")
@@ -587,7 +649,10 @@ def calculate_recommended_price(
         "Candidate optimization",
         reference_price,
         optimized_price,
-        f"Selected the candidate ADR with the highest expected room revenue using elasticity {elasticity:.2f}.",
+        (
+            f"Selected the candidate ADR using {selected_objective.replace('_', ' ')} "
+            f"with elasticity {elasticity:.2f}."
+        ),
     )
     _add_component(
         components,
@@ -645,8 +710,15 @@ def calculate_recommended_price(
         market_context,
         compression["allowed_premium_pct"],
     )
-    final_expected_rooms = final_expected_occupancy * BASE_CAPACITY
-    final_expected_revenue = final_price * final_expected_rooms
+    final_metrics = _candidate_room_metrics(
+        final_price,
+        final_expected_occupancy,
+        total_rooms,
+        retained_rooms,
+        sellable_rooms,
+    )
+    final_expected_rooms = final_metrics["modeled_total_rooms"]
+    final_expected_revenue = final_metrics["modeled_total_revenue"]
     review_flags = _manual_review_flags(
         final_price,
         reference_price,
@@ -676,6 +748,11 @@ def calculate_recommended_price(
         "raw_otb_occupancy": round(raw_otb_occupancy, 4) if raw_otb_occupancy is not None else None,
         "adjusted_otb_occupancy": round(adjusted_otb_occupancy, 4) if adjusted_otb_occupancy is not None else None,
         "expected_cancellations": _round_money(expected_cancellations),
+        "total_rooms": round(total_rooms, 2),
+        "retained_rooms": round(retained_rooms, 2),
+        "sellable_rooms": round(sellable_rooms, 2),
+        "pricing_mode": pricing_mode,
+        "selected_objective": selected_objective if pricing_mode == "remaining_room_optimization" else "rate_protection",
         "sold_out": sold_out,
         "pricing_regime": "sold_out_protect_rate" if sold_out else "normal",
         "sold_out_floor_price": _round_money(sold_out_floor_price) if sold_out_floor_price is not None else None,
@@ -707,9 +784,21 @@ def calculate_recommended_price(
             "expected_occupancy": round(final_expected_occupancy, 4),
             "expected_rooms": round(final_expected_rooms, 2),
             "expected_revenue": _round_money(final_expected_revenue),
+            "modeled_total_rooms": final_metrics["modeled_total_rooms"],
+            "modeled_total_revenue": final_metrics["modeled_total_revenue"],
+            "remaining_rooms": final_metrics["remaining_rooms"],
+            "remaining_revenue": final_metrics["remaining_revenue"],
+            "candidate_remaining_rooms": final_metrics["candidate_remaining_rooms"],
+            "candidate_remaining_revenue": final_metrics["candidate_remaining_revenue"],
         },
         "expected_rooms": round(final_expected_rooms, 2),
         "expected_revenue": _round_money(final_expected_revenue),
+        "modeled_total_rooms": final_metrics["modeled_total_rooms"],
+        "modeled_total_revenue": final_metrics["modeled_total_revenue"],
+        "remaining_rooms": final_metrics["remaining_rooms"],
+        "remaining_revenue": final_metrics["remaining_revenue"],
+        "candidate_remaining_rooms": final_metrics["candidate_remaining_rooms"],
+        "candidate_remaining_revenue": final_metrics["candidate_remaining_revenue"],
         "competitor_gap_pct": _round_money(((final_price - competitor_price) / competitor_price) * 100) if competitor_price else None,
         "comp_median_gap_pct": _round_money(((final_price - competitor_price) / competitor_price) * 100) if competitor_price else None,
         "comp_high_gap_pct": _round_money(((final_price - market_context["comp_high"]) / market_context["comp_high"]) * 100) if market_context.get("comp_high") else None,

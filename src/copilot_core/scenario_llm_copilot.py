@@ -104,7 +104,10 @@ PROTECTED_BUSINESS_TERMS = {
     "cancellations": ("cancellations", "expected_cancellations"),
     "pricing pace": ("pricing pace", "pricing_pace", "pricing_pace_index"),
     "market regime": ("market regime", "market_regime"),
-    "revenue upside": ("revenue upside", "revenue_upside"),
+    "remaining room opportunity": ("remaining room opportunity", "remaining_room_opportunity"),
+    "revenue opportunity": ("revenue opportunity", "remaining_room_opportunity"),
+    "modeled lift": ("modeled lift", "modeled_lift_vs_booked_adr"),
+    "revenue upside": ("revenue upside", "modeled_lift_vs_booked_adr", "revenue_upside"),
     "review needed": ("review needed", "review_status"),
     "manual approval": ("manual approval", "manual_approval_required"),
     "mae": ("mae", "mae_pp"),
@@ -1083,7 +1086,8 @@ def _horizon_risk_payload(records: List[Dict[str, Any]], limit: int = 5) -> List
             bool(item.get("manual_approval_required")),
             bool(item.get("sold_out")) and bool(item.get("material_retention_gap")),
             len(item.get("review_flags") or []),
-            _safe_float(item.get("revenue_upside"), 0.0),
+            _safe_float(item.get("remaining_room_opportunity"), 0.0),
+            _safe_float(item.get("modeled_lift_vs_booked_adr", item.get("revenue_upside")), 0.0),
             str(item.get("date", "")),
         ),
         reverse=True,
@@ -1092,11 +1096,17 @@ def _horizon_risk_payload(records: List[Dict[str, Any]], limit: int = 5) -> List
 
 
 def _horizon_opportunity_payload(records: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    opportunity_records = [
+        record
+        for record in records
+        if _safe_float(record.get("remaining_room_opportunity"), 0.0) > 0
+        and str(record.get("pricing_mode", "")) != "rate_protection"
+    ]
     ranked = sorted(
-        records,
+        opportunity_records,
         key=lambda item: (
-            _safe_float(item.get("revenue_upside"), 0.0),
-            _safe_float(item.get("expected_revenue"), 0.0),
+            _safe_float(item.get("remaining_room_opportunity"), 0.0),
+            _safe_float(item.get("sellable_rooms"), 0.0),
             str(item.get("date", "")),
         ),
         reverse=True,
@@ -1112,7 +1122,12 @@ def _compact_horizon_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "likely_retained_occupancy_pct": round(_safe_float(record.get("adjusted_otb_occupancy"), 0.0) * 100, 1),
         "forecast_occupancy_pct": round(_safe_float(record.get("forecasted_occupancy"), 0.0) * 100, 1),
         "comp_median": record.get("competitor_median"),
+        "sellable_rooms": record.get("sellable_rooms"),
+        "remaining_room_opportunity": record.get("remaining_room_opportunity"),
+        "modeled_lift_vs_booked_adr": record.get("modeled_lift_vs_booked_adr"),
         "revenue_upside": record.get("revenue_upside"),
+        "recommended_action": record.get("recommended_action"),
+        "pricing_mode": record.get("pricing_mode"),
         "review_status": record.get("review_status"),
         "manual_approval_required": record.get("manual_approval_required"),
         "sold_out": record.get("sold_out"),

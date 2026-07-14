@@ -127,12 +127,17 @@ class ExplainablePricingTests(unittest.TestCase):
         self.assertEqual(
             [row["Signal"] for row in result["decision_context_components"]],
             [
+                "Recommended action",
+                "Sellable rooms",
+                "Expected cancellations",
                 "Current booked occupancy",
                 "Likely retained occupancy",
                 "Booked pace",
                 "Recent pickup trend",
                 "Demand used for pricing",
                 "Competitor median",
+                "Pricing mode",
+                "Remaining-room revenue",
                 "Allowed premium vs market",
                 "AI advisory",
             ],
